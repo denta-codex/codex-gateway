@@ -151,6 +151,32 @@ func (a *Auth) Token(ctx context.Context) (string, string, error) {
 	return current.Tokens.AccessToken, current.Tokens.AccountID, nil
 }
 
+// RefreshIfUnchanged asks Codex to rotate a rejected token only when another
+// request has not already refreshed it. Callers must use this before sending
+// inference, since a dispatched inference cannot safely be replayed.
+func (a *Auth) RefreshIfUnchanged(ctx context.Context, rejectedToken string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	current, err := a.read()
+	if err != nil {
+		return err
+	}
+	if current.Tokens.AccessToken != rejectedToken {
+		return nil
+	}
+	if err := a.refresh(ctx); err != nil {
+		return err
+	}
+	updated, err := a.read()
+	if err != nil {
+		return err
+	}
+	if updated.Tokens.AccessToken == rejectedToken {
+		return errors.New("Grace ChatGPT token was not refreshed")
+	}
+	return nil
+}
+
 // ReadOnlyToken is used by deployment previews. It never asks Codex to rotate
 // credentials, so Ansible check mode cannot change Grace's login state.
 func (a *Auth) ReadOnlyToken(context.Context) (string, string, error) {

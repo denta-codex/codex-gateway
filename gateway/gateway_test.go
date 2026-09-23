@@ -123,6 +123,14 @@ func TestAdapterDispatchAndMissingNamespace(t *testing.T) {
 			t.Fatalf("%s status=%d", test.model, response.StatusCode)
 		}
 	}
+	compact, err := http.Post(server.URL+"/v1/responses/compact", "application/json", strings.NewReader(`{"model":"example/echo"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compact.Body.Close()
+	if compact.StatusCode != 501 {
+		t.Fatalf("namespaced compact status=%d", compact.StatusCode)
+	}
 	if upstreamCalls != 0 {
 		t.Fatalf("adapter request leaked to subscription: %d", upstreamCalls)
 	}

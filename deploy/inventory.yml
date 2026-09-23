@@ -9,4 +9,5 @@ all:
           gateway_expected_arch: x86_64
           gateway_home: /home/agent
           gateway_go_binary: /home/agent/.local/share/mise/installs/go/1.27.0/bin/go
+          gateway_uv_binary: /home/agent/.local/share/mise/installs/uv/0.12.11/.mise-bins/uv
           gateway_codex_binary: /home/agent/.local/share/mise/shims/codex

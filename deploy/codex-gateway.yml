@@ -6,6 +6,7 @@
     gateway_test_mode: "{{ gateway_disposable | default(false) | bool }}"
     gateway_repo: "{{ playbook_dir | dirname }}"
     gateway_release_root: "{{ gateway_home }}/.local/share/codex-gateway"
+    gateway_release_dir: "{{ gateway_release_root }}/releases/{{ gateway_commit.stdout }}"
     gateway_state_root: "{{ gateway_home }}/.local/state/codex-gateway"
     gateway_catalog_path: "{{ gateway_state_root }}/model-catalog.json"
     gateway_codex_config: "{{ gateway_home }}/.codex/config.toml"
@@ -76,6 +77,15 @@
       environment:
         GOCACHE: "{{ gateway_build_dir.path }}/go-cache"
         GOTOOLCHAIN: local
+      changed_when: false
+      check_mode: false
+
+    - name: Validate pinned ChatGPT transport dependencies in disposable cache
+      ansible.builtin.command:
+        argv: ["{{ gateway_uv_binary }}", run, --no-project, --with, 'curl_cffi==0.16.3', --with, 'websocket-client==1.9.2', python, -c, 'import curl_cffi, websocket']
+        chdir: "{{ gateway_repo }}"
+      environment:
+        UV_CACHE_DIR: "{{ gateway_build_dir.path }}/uv-cache"
       changed_when: false
       check_mode: false
 
@@ -233,6 +243,35 @@
             remote_src: true
             mode: '0755'
           register: gateway_binary_copy
+
+        - name: Check staged ChatGPT dependency cache
+          ansible.builtin.stat:
+            path: "{{ gateway_release_dir }}/chatgpt-dependencies-ready"
+          register: gateway_chatgpt_dependencies
+          changed_when: false
+
+        - name: Stage pinned ChatGPT transport dependencies
+          ansible.builtin.command:
+            argv: ["{{ gateway_uv_binary }}", run, --no-project, --with, 'curl_cffi==0.16.3', --with, 'websocket-client==1.9.2', python, -c, 'import curl_cffi, websocket']
+            chdir: "{{ gateway_repo }}"
+          environment:
+            UV_CACHE_DIR: "{{ gateway_release_dir }}/uv-cache"
+          when: not gateway_chatgpt_dependencies.stat.exists
+
+        - name: Mark staged ChatGPT dependencies ready
+          ansible.builtin.file:
+            path: "{{ gateway_release_dir }}/chatgpt-dependencies-ready"
+            state: touch
+            mode: '0600'
+          when: not gateway_chatgpt_dependencies.stat.exists
+
+        - name: Verify staged ChatGPT dependencies work offline
+          ansible.builtin.command:
+            argv: ["{{ gateway_uv_binary }}", run, --offline, --no-project, --with, 'curl_cffi==0.16.3', --with, 'websocket-client==1.9.2', python, -c, 'import curl_cffi, websocket']
+            chdir: "{{ gateway_repo }}"
+          environment:
+            UV_CACHE_DIR: "{{ gateway_release_dir }}/uv-cache"
+          changed_when: false
 
         - name: Stage verified model catalog
           ansible.builtin.copy:

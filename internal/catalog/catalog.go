@@ -76,14 +76,21 @@ func Merge(native []byte, adapters []adapter.Adapter) ([]byte, error) {
 		return nil, errors.New("empty subscription model catalog")
 	}
 	seen := map[string]bool{}
+	var nativeTemplate map[string]json.RawMessage
 	for _, row := range document.Models {
 		var item struct {
-			Slug string `json:"slug"`
+			Slug       string `json:"slug"`
+			Visibility string `json:"visibility"`
 		}
 		if json.Unmarshal(row, &item) != nil || item.Slug == "" || seen[item.Slug] {
 			return nil, errors.New("invalid subscription model catalog")
 		}
 		seen[item.Slug] = true
+		if nativeTemplate == nil && item.Visibility != "hide" {
+			if err := json.Unmarshal(row, &nativeTemplate); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for _, extension := range adapters {
 		namespace := extension.Namespace()
@@ -94,14 +101,38 @@ func Merge(native []byte, adapters []adapter.Adapter) ([]byte, error) {
 			if !strings.HasPrefix(model.Slug, namespace+"/") || seen[model.Slug] {
 				return nil, fmt.Errorf("invalid or duplicate adapter model %q", model.Slug)
 			}
-			var row struct {
-				Slug string `json:"slug"`
-			}
-			if json.Unmarshal(model.Catalog, &row) != nil || row.Slug != model.Slug {
+			var overrides map[string]json.RawMessage
+			if json.Unmarshal(model.Catalog, &overrides) != nil {
 				return nil, fmt.Errorf("invalid catalog row for %q", model.Slug)
 			}
+			var slug string
+			if json.Unmarshal(overrides["slug"], &slug) != nil || slug != model.Slug {
+				return nil, fmt.Errorf("invalid catalog row for %q", model.Slug)
+			}
+			row := model.Catalog
+			if model.TemplateNative {
+				if nativeTemplate == nil {
+					return nil, errors.New("catalog has no listable native model template")
+				}
+				merged := make(map[string]json.RawMessage, len(nativeTemplate)+len(overrides))
+				for key, value := range nativeTemplate {
+					merged[key] = value
+				}
+				for key, value := range overrides {
+					if string(value) == "null" {
+						delete(merged, key)
+					} else {
+						merged[key] = value
+					}
+				}
+				var err error
+				row, err = json.Marshal(merged)
+				if err != nil {
+					return nil, err
+				}
+			}
 			seen[model.Slug] = true
-			document.Models = append(document.Models, model.Catalog)
+			document.Models = append(document.Models, row)
 		}
 	}
 	return json.MarshalIndent(document, "", "  ")

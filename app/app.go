@@ -48,6 +48,11 @@ func Run(ctx context.Context, args []string, extensions ...adapter.Adapter) erro
 		return err
 	}
 	auth := &subscription.Auth{Path: *authPath, CodexBinary: *codexBinary}
+	for _, extension := range extensions {
+		if consumer, ok := extension.(adapter.SubscriptionAuthConsumer); ok {
+			consumer.SetSubscriptionAuth(auth)
+		}
+	}
 	switch args[0] {
 	case "catalog":
 		if len(flags.Args()) != 0 {

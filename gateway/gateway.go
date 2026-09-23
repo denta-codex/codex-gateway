@@ -208,7 +208,7 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := ""
-	if r.Method == http.MethodPost && r.URL.Path == "/v1/responses" {
+	if r.Method == http.MethodPost && (r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/responses/compact") {
 		model, err = modelFromBody(body)
 		if err != nil {
 			writeError(w, 400, "invalid_json", "Responses body must be JSON")
@@ -217,6 +217,10 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if extension, namespaced := g.adapterFor(model); namespaced {
 			if extension == nil {
 				writeError(w, 404, "adapter_unavailable", "no adapter registered for model namespace")
+				return
+			}
+			if r.URL.Path == "/v1/responses/compact" {
+				writeError(w, 501, "adapter_compaction_unsupported", "adapter does not support Responses compaction")
 				return
 			}
 			extension.ServeResponses(w, r, body)
