@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ gateway_expected_user }}
+Group={{ gateway_expected_user }}
+WorkingDirectory={{ gateway_home }}
+Environment=HOME={{ gateway_home }}
+Environment=PATH={{ gateway_home }}/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart={{ gateway_release_root }}/current/codex-gateway serve --listen 127.0.0.1:48766 --auth-file {{ gateway_home }}/.codex/auth.json --catalog {{ gateway_catalog_path }} --codex-binary {{ gateway_codex_binary }}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

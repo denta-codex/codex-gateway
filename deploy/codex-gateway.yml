@@ -1,0 +1,448 @@
+---
+- name: Build, preview, and deploy Codex Gateway on Grace
+  hosts: grace
+  gather_facts: false
+  vars:
+    gateway_test_mode: "{{ gateway_disposable | default(false) | bool }}"
+    gateway_repo: "{{ playbook_dir | dirname }}"
+    gateway_release_root: "{{ gateway_home }}/.local/share/codex-gateway"
+    gateway_state_root: "{{ gateway_home }}/.local/state/codex-gateway"
+    gateway_catalog_path: "{{ gateway_state_root }}/model-catalog.json"
+    gateway_codex_config: "{{ gateway_home }}/.codex/config.toml"
+    gateway_unit_path: "{{ (gateway_state_root + '/codex-gateway.service') if gateway_test_mode else '/etc/systemd/system/codex-gateway.service' }}"
+    gateway_config_block: |
+      openai_base_url = "http://127.0.0.1:48766/v1"
+      model_catalog_json = "{{ gateway_catalog_path }}"
+  tasks:
+    - name: Read target identity
+      ansible.builtin.command:
+        argv: [sh, -c, 'hostname; id -un; uname -m']
+      register: gateway_identity
+      changed_when: false
+      check_mode: false
+
+    - name: Assert Grace identity and absolute paths
+      ansible.builtin.assert:
+        that:
+          - gateway_identity.stdout_lines == [gateway_expected_hostname, gateway_expected_user, gateway_expected_arch]
+          - gateway_home is match('^(/home/[^/]+|/tmp/codex-gateway-disposable-[^/]+)$')
+          - gateway_release_root == gateway_home + '/.local/share/codex-gateway'
+          - gateway_catalog_path == gateway_home + '/.local/state/codex-gateway/model-catalog.json'
+          - not gateway_test_mode or gateway_home is match('^/tmp/codex-gateway-disposable-[^/]+$')
+
+    - name: Require a clean committed source tree
+      ansible.builtin.command:
+        argv: [git, status, --porcelain=v1, --untracked-files=normal]
+        chdir: "{{ gateway_repo }}"
+      register: gateway_git_status
+      changed_when: false
+      check_mode: false
+
+    - name: Assert clean source
+      ansible.builtin.assert:
+        that: gateway_git_status.stdout == ''
+        fail_msg: Commit all gateway source before preview or deployment.
+
+    - name: Read exact source commit
+      ansible.builtin.command:
+        argv: [git, rev-parse, HEAD]
+        chdir: "{{ gateway_repo }}"
+      register: gateway_commit
+      changed_when: false
+      check_mode: false
+
+    - name: Create disposable controller build directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: codex-gateway-build-
+      register: gateway_build_dir
+      changed_when: false
+      check_mode: false
+
+    - name: Test gateway source
+      ansible.builtin.command:
+        argv: ["{{ gateway_go_binary }}", test, ./...]
+        chdir: "{{ gateway_repo }}"
+      environment:
+        GOCACHE: "{{ gateway_build_dir.path }}/go-cache"
+        GOTOOLCHAIN: local
+      changed_when: false
+      check_mode: false
+
+    - name: Build exact gateway binary
+      ansible.builtin.command:
+        argv: ["{{ gateway_go_binary }}", build, -trimpath, -buildvcs=true, -o, "{{ gateway_build_dir.path }}/codex-gateway", ./cmd/codex-gateway]
+        chdir: "{{ gateway_repo }}"
+      environment:
+        GOCACHE: "{{ gateway_build_dir.path }}/go-cache"
+        GOTOOLCHAIN: local
+      changed_when: false
+      check_mode: false
+
+    - name: Fetch and validate candidate catalog
+      ansible.builtin.command:
+        argv: "{{ [gateway_build_dir.path + '/codex-gateway', 'catalog', 'refresh', '--catalog', gateway_build_dir.path + '/model-catalog.json', '--codex-binary', gateway_codex_binary] + (['--no-auth-refresh'] if ansible_check_mode else []) }}"
+      register: gateway_catalog_refresh
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Create isolated Codex verification home
+      ansible.builtin.file:
+        path: "{{ gateway_build_dir.path }}/codex-home"
+        state: directory
+        mode: '0700'
+      changed_when: false
+      check_mode: false
+
+    - name: Verify candidate with fresh Codex model/list
+      ansible.builtin.command:
+        argv: ["{{ gateway_build_dir.path }}/codex-gateway", verify-model-list, --catalog, "{{ gateway_build_dir.path }}/model-catalog.json", --codex-binary, "{{ gateway_codex_binary }}"]
+      environment:
+        CODEX_HOME: "{{ gateway_build_dir.path }}/codex-home"
+      changed_when: false
+      check_mode: false
+
+    - name: Read candidate and installed artifact checksums
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ gateway_build_dir.path }}/codex-gateway"
+        - "{{ gateway_release_root }}/current/codex-gateway"
+        - "{{ gateway_build_dir.path }}/model-catalog.json"
+        - "{{ gateway_catalog_path }}"
+      register: gateway_checksums
+      changed_when: false
+      check_mode: false
+
+    - name: Preview binary and catalog changes
+      ansible.builtin.debug:
+        msg: "binary={{ gateway_checksums.results[0].stat.checksum != (gateway_checksums.results[1].stat.checksum | default('absent')) }}, catalog={{ gateway_checksums.results[2].stat.checksum != (gateway_checksums.results[3].stat.checksum | default('absent')) }}"
+      changed_when: gateway_checksums.results[0].stat.checksum != (gateway_checksums.results[1].stat.checksum | default('absent')) or gateway_checksums.results[2].stat.checksum != (gateway_checksums.results[3].stat.checksum | default('absent'))
+      when: ansible_check_mode
+
+    - name: Preview system service
+      ansible.builtin.template:
+        src: templates/codex-gateway.service.j2
+        dest: "{{ gateway_unit_path }}"
+        owner: "{{ gateway_expected_user if gateway_test_mode else 'root' }}"
+        group: "{{ gateway_expected_user if gateway_test_mode else 'root' }}"
+        mode: '0644'
+      become: "{{ not gateway_test_mode }}"
+      when: ansible_check_mode
+
+    - name: Preview Grace Codex configuration
+      ansible.builtin.blockinfile:
+        path: "{{ gateway_codex_config }}"
+        marker: '# {mark} CODEX GATEWAY MANAGED'
+        insertbefore: BOF
+        block: "{{ gateway_config_block }}"
+      when: ansible_check_mode
+
+    - name: Read previous current release
+      ansible.builtin.command:
+        argv: [readlink, "{{ gateway_release_root }}/current"]
+      register: gateway_previous_release
+      failed_when: false
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Read previous service active state
+      ansible.builtin.command:
+        argv: [systemctl, is-active, codex-gateway.service]
+      register: gateway_previous_active
+      failed_when: false
+      changed_when: false
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Read previous service enabled state
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, codex-gateway.service]
+      register: gateway_previous_enabled
+      failed_when: false
+      changed_when: false
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Inspect previous managed files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ gateway_catalog_path }}"
+        - "{{ gateway_codex_config }}"
+        - "{{ gateway_unit_path }}"
+      register: gateway_previous_files
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Require an existing Codex user configuration
+      ansible.builtin.assert:
+        that: gateway_previous_files.results[1].stat.exists
+      when: not ansible_check_mode
+
+    - name: Create private deployment directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - "{{ gateway_release_root }}"
+        - "{{ gateway_release_root }}/releases"
+        - "{{ gateway_state_root }}"
+      when: not ansible_check_mode
+
+    - name: Create private recovery transaction
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ gateway_state_root }}"
+        prefix: transaction-
+      register: gateway_transaction
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Save exact previous managed files for rollback
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ gateway_transaction.path }}/{{ item.name }}"
+        remote_src: true
+        mode: '0600'
+      loop:
+        - {src: "{{ gateway_catalog_path }}", name: catalog.json, exists: "{{ gateway_previous_files.results[0].stat.exists }}"}
+        - {src: "{{ gateway_codex_config }}", name: config.toml, exists: "{{ gateway_previous_files.results[1].stat.exists }}"}
+        - {src: "{{ gateway_unit_path }}", name: unit.service, exists: "{{ gateway_previous_files.results[2].stat.exists }}"}
+      when: not ansible_check_mode and item.exists
+      changed_when: false
+      no_log: true
+
+    - name: Activate and validate release
+      when: not ansible_check_mode
+      block:
+        - name: Stage exact release directory
+          ansible.builtin.file:
+            path: "{{ gateway_release_root }}/releases/{{ gateway_commit.stdout }}"
+            state: directory
+            mode: '0700'
+
+        - name: Stage binary
+          ansible.builtin.copy:
+            src: "{{ gateway_build_dir.path }}/codex-gateway"
+            dest: "{{ gateway_release_root }}/releases/{{ gateway_commit.stdout }}/codex-gateway"
+            remote_src: true
+            mode: '0755'
+          register: gateway_binary_copy
+
+        - name: Stage verified model catalog
+          ansible.builtin.copy:
+            src: "{{ gateway_build_dir.path }}/model-catalog.json"
+            dest: "{{ gateway_catalog_path }}"
+            remote_src: true
+            mode: '0600'
+          register: gateway_catalog_copy
+
+        - name: Prepare next release link
+          ansible.builtin.command:
+            argv: [ln, -sfn, "{{ gateway_release_root }}/releases/{{ gateway_commit.stdout }}", "{{ gateway_release_root }}/current.next"]
+          changed_when: false
+          when: gateway_previous_release.stdout != gateway_release_root + '/releases/' + gateway_commit.stdout
+
+        - name: Atomically activate release link
+          ansible.builtin.command:
+            argv: [mv, -Tf, "{{ gateway_release_root }}/current.next", "{{ gateway_release_root }}/current"]
+          when: gateway_previous_release.stdout != gateway_release_root + '/releases/' + gateway_commit.stdout
+          register: gateway_release_switch
+
+        - name: Install system service
+          ansible.builtin.template:
+            src: templates/codex-gateway.service.j2
+            dest: "{{ gateway_unit_path }}"
+            owner: "{{ gateway_expected_user if gateway_test_mode else 'root' }}"
+            group: "{{ gateway_expected_user if gateway_test_mode else 'root' }}"
+            mode: '0644'
+          become: "{{ not gateway_test_mode }}"
+          register: gateway_unit_copy
+
+        - name: Start or restart gateway service
+          ansible.builtin.systemd_service:
+            name: codex-gateway.service
+            daemon_reload: true
+            enabled: true
+            state: "{{ 'restarted' if gateway_binary_copy.changed or (gateway_release_switch.changed | default(false)) or gateway_unit_copy.changed else 'started' }}"
+          become: true
+          when: not gateway_test_mode
+
+        - name: Wait for gateway readiness
+          ansible.builtin.uri:
+            url: http://127.0.0.1:48766/ready
+            status_code: 200
+            return_content: true
+          register: gateway_ready
+          retries: 10
+          delay: 2
+          until: gateway_ready.status == 200
+          changed_when: false
+          when: not gateway_test_mode
+
+        - name: Activate Grace Codex routing
+          ansible.builtin.blockinfile:
+            path: "{{ gateway_codex_config }}"
+            marker: '# {mark} CODEX GATEWAY MANAGED'
+            insertbefore: BOF
+            block: "{{ gateway_config_block }}"
+          register: gateway_codex_config_change
+
+        - name: Verify activated catalog with fresh Codex model/list
+          ansible.builtin.command:
+            argv: ["{{ gateway_release_root }}/current/codex-gateway", verify-model-list, --catalog, "{{ gateway_catalog_path }}", --codex-binary, "{{ gateway_codex_binary }}"]
+          environment:
+            CODEX_HOME: "{{ gateway_build_dir.path }}/codex-home"
+          changed_when: false
+
+        - name: Validate fresh Codex catalog load
+          ansible.builtin.command:
+            argv: ["{{ gateway_codex_binary }}", debug, models]
+          register: gateway_codex_catalog_check
+          changed_when: false
+          no_log: true
+          when: not gateway_test_mode
+
+        - name: Verify Codex loaded a nonempty catalog
+          ansible.builtin.assert:
+            that: (gateway_codex_catalog_check.stdout | from_json).models | length > 0
+          when: not gateway_test_mode
+
+        - name: Force post-activation failure in disposable rollback test
+          ansible.builtin.fail:
+            msg: Deliberate disposable rollback test failure.
+          when: gateway_test_mode and (gateway_force_fail_after_activation | default(false) | bool)
+
+        - name: Record successful release
+          ansible.builtin.copy:
+            dest: "{{ gateway_state_root }}/receipt.json"
+            mode: '0600'
+            content: "{{ {'commit': gateway_commit.stdout, 'binary_sha256': gateway_checksums.results[0].stat.checksum, 'catalog_sha256': gateway_checksums.results[2].stat.checksum, 'host': gateway_expected_hostname, 'account': gateway_expected_user} | to_nice_json }}\n"
+
+      rescue:
+        - name: Restore previous Codex configuration
+          ansible.builtin.copy:
+            src: "{{ gateway_transaction.path }}/config.toml"
+            dest: "{{ gateway_codex_config }}"
+            remote_src: true
+            mode: '0600'
+          no_log: true
+
+        - name: Restore previous catalog
+          ansible.builtin.copy:
+            src: "{{ gateway_transaction.path }}/catalog.json"
+            dest: "{{ gateway_catalog_path }}"
+            remote_src: true
+            mode: '0600'
+          when: gateway_previous_files.results[0].stat.exists
+
+        - name: Remove new catalog if none existed
+          ansible.builtin.file:
+            path: "{{ gateway_catalog_path }}"
+            state: absent
+          when: not gateway_previous_files.results[0].stat.exists
+
+        - name: Prepare previous release link
+          ansible.builtin.command:
+            argv: [ln, -sfn, "{{ gateway_previous_release.stdout }}", "{{ gateway_release_root }}/current.next"]
+          when: gateway_previous_release.rc == 0
+
+        - name: Restore previous release link
+          ansible.builtin.command:
+            argv: [mv, -Tf, "{{ gateway_release_root }}/current.next", "{{ gateway_release_root }}/current"]
+          when: gateway_previous_release.rc == 0
+
+        - name: Remove release link if none existed
+          ansible.builtin.file:
+            path: "{{ gateway_release_root }}/current"
+            state: absent
+          when: gateway_previous_release.rc != 0
+
+        - name: Restore previous service unit
+          ansible.builtin.copy:
+            src: "{{ gateway_transaction.path }}/unit.service"
+            dest: "{{ gateway_unit_path }}"
+            remote_src: true
+            mode: '0644'
+          become: "{{ not gateway_test_mode }}"
+          when: gateway_previous_files.results[2].stat.exists
+
+        - name: Remove new service unit if none existed
+          ansible.builtin.file:
+            path: "{{ gateway_unit_path }}"
+            state: absent
+          become: "{{ not gateway_test_mode }}"
+          when: not gateway_previous_files.results[2].stat.exists
+
+        - name: Restore service state
+          ansible.builtin.systemd_service:
+            name: codex-gateway.service
+            daemon_reload: true
+            enabled: "{{ gateway_previous_enabled.stdout == 'enabled' }}"
+            state: "{{ 'restarted' if gateway_previous_active.stdout == 'active' else 'stopped' }}"
+          become: true
+          when: not gateway_test_mode
+
+        - name: Inspect restored files
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            checksum_algorithm: sha256
+          loop:
+            - "{{ gateway_catalog_path }}"
+            - "{{ gateway_codex_config }}"
+            - "{{ gateway_unit_path }}"
+          register: gateway_restored_files
+          changed_when: false
+
+        - name: Inspect restored release link
+          ansible.builtin.command:
+            argv: [readlink, "{{ gateway_release_root }}/current"]
+          register: gateway_restored_release
+          failed_when: false
+          changed_when: false
+
+        - name: Verify rollback restored the previous state
+          ansible.builtin.assert:
+            that:
+              - gateway_restored_files.results[1].stat.checksum == gateway_previous_files.results[1].stat.checksum
+              - gateway_restored_files.results[0].stat.exists == gateway_previous_files.results[0].stat.exists
+              - gateway_restored_files.results[2].stat.exists == gateway_previous_files.results[2].stat.exists
+              - not gateway_previous_files.results[0].stat.exists or gateway_restored_files.results[0].stat.checksum == gateway_previous_files.results[0].stat.checksum
+              - not gateway_previous_files.results[2].stat.exists or gateway_restored_files.results[2].stat.checksum == gateway_previous_files.results[2].stat.checksum
+              - gateway_restored_release.rc == gateway_previous_release.rc
+              - gateway_previous_release.rc != 0 or gateway_restored_release.stdout == gateway_previous_release.stdout
+
+        - name: Clean verified rollback transaction
+          ansible.builtin.file:
+            path: "{{ gateway_transaction.path }}"
+            state: absent
+          changed_when: false
+
+        - name: Clean disposable controller build after rollback
+          ansible.builtin.file:
+            path: "{{ gateway_build_dir.path }}"
+            state: absent
+          changed_when: false
+
+        - name: Stop after rollback
+          ansible.builtin.fail:
+            msg: Gateway activation failed; previous files and release link were verified restored.
+
+    - name: Remove successful recovery transaction
+      ansible.builtin.file:
+        path: "{{ gateway_transaction.path }}"
+        state: absent
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Clean disposable controller build
+      ansible.builtin.file:
+        path: "{{ gateway_build_dir.path }}"
+        state: absent
+      changed_when: false
+      check_mode: false
