@@ -219,8 +219,8 @@
     - name: Preview temporary v1 subagent mode
       ansible.builtin.lineinfile:
         path: "{{ gateway_codex_config }}"
-        regexp: '^multi_agent_v2\\s*='
-        insertafter: '^\\[features\\]$'
+        regexp: '^multi_agent_v2\s*='
+        insertafter: '^\[features\]$'
         line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
       when: ansible_check_mode
 
@@ -409,8 +409,8 @@
         - name: Activate temporary v1 subagent mode
           ansible.builtin.lineinfile:
             path: "{{ gateway_codex_config }}"
-            regexp: '^multi_agent_v2\\s*='
-            insertafter: '^\\[features\\]$'
+            regexp: '^multi_agent_v2\s*='
+            insertafter: '^\[features\]$'
             line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
           register: gateway_subagent_mode_change
 
