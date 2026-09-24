@@ -96,6 +96,8 @@
       register: gateway_modal_credential
       changed_when: false
       check_mode: false
+      become: true
+      when: not gateway_test_mode
 
     - name: Require a private Modal inference credential for live deployment
       ansible.builtin.assert:
