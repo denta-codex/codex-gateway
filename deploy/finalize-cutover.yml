@@ -11,6 +11,13 @@
     gateway_codex_config: "{{ gateway_home }}/.codex/config.toml"
     gateway_unit_path: /etc/systemd/system/codex-gateway.service
     gateway_app_server_socket: "{{ gateway_home }}/.codex/app-server-control/app-server-control.sock"
+    gateway_managed_config_block: |
+      # BEGIN CODEX GATEWAY MANAGED
+      openai_base_url = "http://127.0.0.1:48766/v1"
+      model_providers.chatgpt_gateway = { name = "ChatGPT Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses" }
+      model_providers.modal_gateway = { name = "Modal Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses", request_max_retries = 0, stream_max_retries = 0 }
+      # END CODEX GATEWAY MANAGED
+    gateway_subagent_mode_line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
   tasks:
     - name: Read target identity
       ansible.builtin.command:
@@ -100,10 +107,24 @@
           - gateway_current_release.stdout == gateway_release_root + '/releases/' + gateway_pending.commit
           - gateway_activated_files.results[0].stat.checksum == gateway_pending.binary_sha256
           - gateway_activated_files.results[1].stat.checksum == gateway_pending.catalog_sha256
-          - gateway_activated_files.results[2].stat.checksum == gateway_pending.config_sha256
           - gateway_activated_files.results[3].stat.checksum == gateway_pending.unit_sha256
           - gateway_activated_files.results[4].stat.isdir
         fail_msg: Prepared artifacts changed before finalization; retain the pending transaction and roll back.
+
+    # config.toml is a living Codex document and may record an unrelated model
+    # selection during restart. Validate only the settings owned by this rollout.
+    - name: Read activated Codex configuration
+      ansible.builtin.slurp:
+        src: "{{ gateway_codex_config }}"
+      register: gateway_codex_config_raw
+      no_log: true
+
+    - name: Require the managed Codex settings to remain active
+      ansible.builtin.assert:
+        that:
+          - gateway_managed_config_block in (gateway_codex_config_raw.content | b64decode)
+          - gateway_subagent_mode_line in (gateway_codex_config_raw.content | b64decode).splitlines()
+        fail_msg: Managed Codex settings changed before finalization; retain the pending transaction and roll back.
 
     - name: Inspect replacement Codex app server
       ansible.builtin.command:
