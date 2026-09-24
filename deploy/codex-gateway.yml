@@ -14,6 +14,7 @@
     gateway_config_block: |
       openai_base_url = "http://127.0.0.1:48766/v1"
       model_catalog_json = "{{ gateway_catalog_path }}"
+      model_providers.chatgpt_gateway = { name = "ChatGPT Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses" }
   tasks:
     - name: Read target identity
       ansible.builtin.command:

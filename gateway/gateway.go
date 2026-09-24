@@ -3,6 +3,7 @@ package gateway
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/denta-codex/codex-gateway/adapter"
 	"github.com/denta-codex/codex-gateway/internal/subscription"
+	"github.com/klauspost/compress/zstd"
 )
 
 const MaxRequestBytes int64 = 128 << 20
@@ -155,6 +157,43 @@ func modelFromBody(body []byte) (string, error) {
 	return value.Model, nil
 }
 
+func decodedRequestBody(body []byte, encoding string) ([]byte, int, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "identity":
+		return body, 0, nil
+	case "zstd":
+		decoder, err := zstd.NewReader(bytes.NewReader(body), zstd.WithDecoderLowmem(true), zstd.WithDecoderMaxMemory(uint64(MaxRequestBytes)))
+		if err != nil {
+			return nil, 400, err
+		}
+		defer decoder.Close()
+		decoded, err := io.ReadAll(io.LimitReader(decoder, MaxRequestBytes+1))
+		if err != nil {
+			return nil, 400, err
+		}
+		if int64(len(decoded)) > MaxRequestBytes {
+			return nil, 413, errors.New("decoded request exceeds gateway limit")
+		}
+		return decoded, 0, nil
+	case "gzip":
+		decoder, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, 400, err
+		}
+		defer decoder.Close()
+		decoded, err := io.ReadAll(io.LimitReader(decoder, MaxRequestBytes+1))
+		if err != nil {
+			return nil, 400, err
+		}
+		if int64(len(decoded)) > MaxRequestBytes {
+			return nil, 413, errors.New("decoded request exceeds gateway limit")
+		}
+		return decoded, 0, nil
+	default:
+		return nil, 415, errors.New("unsupported content encoding")
+	}
+}
+
 func (g *Gateway) adapterFor(model string) (adapter.Adapter, bool) {
 	namespace, _, namespaced := strings.Cut(model, "/")
 	if !namespaced {
@@ -169,7 +208,7 @@ var hopHeaders = map[string]bool{
 }
 
 func copyRequestHeaders(dst, src http.Header) {
-	for _, key := range []string{"Accept", "Content-Type", "OpenAI-Beta", "X-OpenAI-Internal-Codex-Responses-Lite", "X-OpenAI-Memgen-Request", "User-Agent", "Session-Id", "Originator"} {
+	for _, key := range []string{"Accept", "Content-Type", "Content-Encoding", "OpenAI-Beta", "X-OpenAI-Internal-Codex-Responses-Lite", "X-OpenAI-Memgen-Request", "User-Agent", "Session-Id", "Originator"} {
 		for _, value := range src.Values(key) {
 			dst.Add(key, value)
 		}
@@ -209,7 +248,12 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	model := ""
 	if r.Method == http.MethodPost && (r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/responses/compact") {
-		model, err = modelFromBody(body)
+		decoded, status, decodeErr := decodedRequestBody(body, r.Header.Get("Content-Encoding"))
+		if decodeErr != nil {
+			writeError(w, status, "invalid_content_encoding", "Responses body could not be decoded")
+			return
+		}
+		model, err = modelFromBody(decoded)
 		if err != nil {
 			writeError(w, 400, "invalid_json", "Responses body must be JSON")
 			return
@@ -223,7 +267,11 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 501, "adapter_compaction_unsupported", "adapter does not support Responses compaction")
 				return
 			}
-			extension.ServeResponses(w, r, body)
+			adapterRequest := r.Clone(r.Context())
+			adapterRequest.Header = r.Header.Clone()
+			adapterRequest.Header.Del("Content-Encoding")
+			adapterRequest.ContentLength = int64(len(decoded))
+			extension.ServeResponses(w, adapterRequest, decoded)
 			g.event("adapter_request", map[string]any{"request_id": id, "path": r.URL.Path, "adapter": extension.Namespace(), "model": model, "duration_ms": time.Since(started).Milliseconds()})
 			return
 		}

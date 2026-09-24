@@ -17,6 +17,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/denta-codex/codex-gateway/adapters/example"
 	"github.com/denta-codex/codex-gateway/internal/subscription"
+	"github.com/klauspost/compress/zstd"
 )
 
 func testAuth(t *testing.T) *subscription.Auth {
@@ -133,6 +134,59 @@ func TestAdapterDispatchAndMissingNamespace(t *testing.T) {
 	}
 	if upstreamCalls != 0 {
 		t.Fatalf("adapter request leaked to subscription: %d", upstreamCalls)
+	}
+}
+
+func TestZstdModelRoutingAndNativeBytePreservation(t *testing.T) {
+	var nativeBody []byte
+	var nativeEncoding string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nativeBody, _ = io.ReadAll(r.Body)
+		nativeEncoding = r.Header.Get("Content-Encoding")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	g, err := New(Config{UpstreamBase: upstream.URL + "/backend-api/codex", CatalogPath: testCatalog(t), Auth: testAuth(t), Client: upstream.Client(), Logger: log.New(io.Discard, "", 0)}, example.Adapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(g)
+	defer server.Close()
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer encoder.Close()
+	for _, model := range []string{"example/echo", "gpt-6-sol"} {
+		plain := []byte(`{"model":"` + model + `","input":"hello"}`)
+		compressed := encoder.EncodeAll(plain, nil)
+		request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/responses", bytes.NewReader(compressed))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Content-Encoding", "zstd")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != 200 {
+			t.Fatalf("%s status=%d", model, response.StatusCode)
+		}
+		if model == "example/echo" && nativeBody != nil {
+			t.Fatal("namespaced compressed request reached native upstream")
+		}
+		if model == "gpt-6-sol" && (!bytes.Equal(nativeBody, compressed) || nativeEncoding != "zstd") {
+			t.Fatal("native compressed request changed in transit")
+		}
+	}
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/responses", strings.NewReader("invalid zstd"))
+	request.Header.Set("Content-Encoding", "zstd")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 400 {
+		t.Fatalf("malformed zstd status=%d", response.StatusCode)
 	}
 }
 
