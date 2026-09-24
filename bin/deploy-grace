@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_dir"
+
+case "${1:-}" in
+  prepare)
+    shift
+    exec ansible-playbook deploy/codex-gateway.yml --limit grace-agent \
+      --extra-vars gateway_cutover_phase=prepare "$@"
+    ;;
+  finalize)
+    shift
+    exec ansible-playbook deploy/finalize-cutover.yml --limit grace-agent "$@"
+    ;;
+  rollback)
+    shift
+    exec ansible-playbook deploy/rollback-cutover.yml --limit grace-agent "$@"
+    ;;
+  *)
+    echo "usage: bin/deploy-grace prepare|finalize|rollback" >&2
+    exit 2
+    ;;
+esac

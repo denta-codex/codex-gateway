@@ -21,6 +21,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/denta-codex/codex-gateway/adapter"
+	"github.com/denta-codex/codex-gateway/internal/catalog"
 	"github.com/denta-codex/codex-gateway/internal/subscription"
 	"github.com/klauspost/compress/zstd"
 )
@@ -117,13 +118,19 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if (r.URL.Path == "/v1/models" || r.URL.Path == "/model-catalog.json") && r.Method == http.MethodGet {
-		data, err := os.ReadFile(g.config.CatalogPath)
+		snapshot, err := catalog.ReadSnapshot(g.config.CatalogPath)
 		if err != nil {
 			writeError(w, 503, "catalog_unavailable", "model catalog unavailable")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(data)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("ETag", snapshot.ETag)
+		if catalog.IfNoneMatch(r.Header.Get("If-None-Match"), snapshot.ETag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write(snapshot.Data)
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -228,6 +235,13 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
+func (g *Gateway) setModelsETag(header http.Header) {
+	header.Del("X-Models-Etag")
+	if snapshot, err := catalog.ReadSnapshot(g.config.CatalogPath); err == nil {
+		header.Set("X-Models-Etag", snapshot.ETag)
+	}
+}
+
 func (g *Gateway) target(path, query string) string {
 	copy := *g.upstream
 	copy.Path = strings.TrimRight(g.upstream.Path, "/") + strings.TrimPrefix(path, "/v1")
@@ -271,6 +285,7 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			adapterRequest.Header = r.Header.Clone()
 			adapterRequest.Header.Del("Content-Encoding")
 			adapterRequest.ContentLength = int64(len(decoded))
+			g.setModelsETag(w.Header())
 			extension.ServeResponses(w, adapterRequest, decoded)
 			g.event("adapter_request", map[string]any{"request_id": id, "path": r.URL.Path, "adapter": extension.Namespace(), "model": model, "duration_ms": time.Since(started).Milliseconds()})
 			return
@@ -303,6 +318,7 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer response.Body.Close()
 	upstreamHeadersMS := time.Since(upstreamStarted).Milliseconds()
 	copyResponseHeaders(w.Header(), response.Header)
+	g.setModelsETag(w.Header())
 	w.WriteHeader(response.StatusCode)
 	observer := newUsageObserver()
 	writer := &streamWriter{Writer: w, flusher: flushOf(w), observer: observer}
@@ -443,9 +459,9 @@ func (g *Gateway) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	results := make(chan error, 2)
-	go func() { results <- pump(ctx, client, upstream, true, nil) }()
+	go func() { results <- pump(ctx, client, upstream, true, nil, nil) }()
 	go func() {
-		results <- pump(ctx, upstream, client, false, func(data []byte) {
+		results <- pump(ctx, upstream, client, false, g.rewriteModelsETagMetadata, func(data []byte) {
 			var message struct {
 				Type     string `json:"type"`
 				StreamID string `json:"stream_id"`
@@ -472,7 +488,7 @@ func (g *Gateway) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	g.event("websocket_closed", fields)
 }
 
-func pump(ctx context.Context, from, to *websocket.Conn, inspect bool, onEvent func([]byte)) error {
+func pump(ctx context.Context, from, to *websocket.Conn, inspect bool, transform func([]byte) []byte, onEvent func([]byte)) error {
 	for {
 		typeID, data, err := from.Read(ctx)
 		if err != nil {
@@ -489,6 +505,9 @@ func pump(ctx context.Context, from, to *websocket.Conn, inspect bool, onEvent f
 				return errors.New("adapter WebSocket transport unavailable")
 			}
 		}
+		if transform != nil && typeID == websocket.MessageText {
+			data = transform(data)
+		}
 		if err := to.Write(ctx, typeID, data); err != nil {
 			return err
 		}
@@ -496,4 +515,47 @@ func pump(ctx context.Context, from, to *websocket.Conn, inspect bool, onEvent f
 			onEvent(data)
 		}
 	}
+}
+
+func (g *Gateway) rewriteModelsETagMetadata(data []byte) []byte {
+	var kind struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &kind) != nil || kind.Type != "codex.response.metadata" {
+		return data
+	}
+	var message map[string]json.RawMessage
+	if json.Unmarshal(data, &message) != nil {
+		return data
+	}
+	headers := map[string]json.RawMessage{}
+	rawHeaders := message["headers"]
+	if len(rawHeaders) > 0 && string(rawHeaders) != "null" && json.Unmarshal(rawHeaders, &headers) != nil {
+		return data
+	}
+	changed := false
+	for key := range headers {
+		if strings.EqualFold(key, "x-models-etag") {
+			delete(headers, key)
+			changed = true
+		}
+	}
+	if snapshot, err := catalog.ReadSnapshot(g.config.CatalogPath); err == nil {
+		encoded, _ := json.Marshal(snapshot.ETag)
+		headers["x-models-etag"] = encoded
+		changed = true
+	}
+	if !changed {
+		return data
+	}
+	encodedHeaders, err := json.Marshal(headers)
+	if err != nil {
+		return data
+	}
+	message["headers"] = encodedHeaders
+	rewritten, err := json.Marshal(message)
+	if err != nil {
+		return data
+	}
+	return rewritten
 }
