@@ -1,0 +1,201 @@
+---
+- name: Roll back a prepared Codex Gateway cutover on Grace
+  hosts: grace
+  gather_facts: false
+  vars:
+    gateway_release_root: "{{ gateway_home }}/.local/share/codex-gateway"
+    gateway_state_root: "{{ gateway_home }}/.local/state/codex-gateway"
+    gateway_catalog_path: "{{ gateway_state_root }}/model-catalog.json"
+    gateway_pending_path: "{{ gateway_state_root }}/pending-cutover.json"
+    gateway_codex_config: "{{ gateway_home }}/.codex/config.toml"
+    gateway_unit_path: /etc/systemd/system/codex-gateway.service
+    gateway_app_server_socket: "{{ gateway_home }}/.codex/app-server-control/app-server-control.sock"
+  tasks:
+    - name: Read target identity
+      ansible.builtin.command:
+        argv: [sh, -c, 'hostname; id -un; uname -m']
+      register: gateway_identity
+      changed_when: false
+
+    - name: Assert Grace identity and absolute paths
+      ansible.builtin.assert:
+        that:
+          - gateway_identity.stdout_lines == [gateway_expected_hostname, gateway_expected_user, gateway_expected_arch]
+          - gateway_home is match('^/home/[^/]+$')
+
+    - name: Inspect pending cutover
+      ansible.builtin.stat:
+        path: "{{ gateway_pending_path }}"
+      register: gateway_pending_file
+      changed_when: false
+
+    - name: Require a pending cutover
+      ansible.builtin.assert:
+        that:
+          - gateway_pending_file.stat.exists
+          - gateway_pending_file.stat.isreg
+          - gateway_pending_file.stat.mode == '0600'
+        fail_msg: No prepared cutover is available to roll back.
+
+    - name: Read pending cutover
+      ansible.builtin.slurp:
+        src: "{{ gateway_pending_path }}"
+      register: gateway_pending_raw
+      no_log: true
+
+    - name: Decode pending cutover
+      ansible.builtin.set_fact:
+        gateway_pending: "{{ gateway_pending_raw.content | b64decode | from_json }}"
+      no_log: true
+
+    - name: Validate rollback transaction identity
+      ansible.builtin.assert:
+        that:
+          - gateway_pending.version == 1
+          - gateway_pending.host == gateway_expected_hostname
+          - gateway_pending.account == gateway_expected_user
+          - gateway_pending.transaction_path is match('^' + gateway_state_root + '/transaction-[A-Za-z0-9_]+$')
+
+    - name: Inspect rollback transaction and app server socket
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ gateway_pending.transaction_path }}"
+        - "{{ gateway_pending.transaction_path }}/config.toml"
+        - "{{ gateway_app_server_socket }}"
+      register: gateway_rollback_inputs
+      changed_when: false
+
+    - name: Require complete rollback inputs
+      ansible.builtin.assert:
+        that:
+          - gateway_rollback_inputs.results[0].stat.isdir
+          - gateway_rollback_inputs.results[1].stat.isreg
+
+    - name: Restore previous Codex configuration
+      ansible.builtin.copy:
+        src: "{{ gateway_pending.transaction_path }}/config.toml"
+        dest: "{{ gateway_codex_config }}"
+        remote_src: true
+        mode: '0600'
+      no_log: true
+
+    - name: Restore previous catalog
+      ansible.builtin.copy:
+        src: "{{ gateway_pending.transaction_path }}/catalog.json"
+        dest: "{{ gateway_catalog_path }}"
+        remote_src: true
+        mode: '0600'
+      when: gateway_pending.previous_catalog_exists
+
+    - name: Remove catalog absent before cutover
+      ansible.builtin.file:
+        path: "{{ gateway_catalog_path }}"
+        state: absent
+      when: not gateway_pending.previous_catalog_exists
+
+    - name: Restore previous service unit
+      ansible.builtin.copy:
+        src: "{{ gateway_pending.transaction_path }}/unit.service"
+        dest: "{{ gateway_unit_path }}"
+        remote_src: true
+        mode: '0644'
+      become: true
+      when: gateway_pending.previous_unit_exists
+
+    - name: Remove service unit absent before cutover
+      ansible.builtin.file:
+        path: "{{ gateway_unit_path }}"
+        state: absent
+      become: true
+      when: not gateway_pending.previous_unit_exists
+
+    - name: Prepare previous release link
+      ansible.builtin.command:
+        argv: [ln, -sfn, "{{ gateway_pending.previous_release }}", "{{ gateway_release_root }}/current.next"]
+      changed_when: false
+      when: gateway_pending.previous_release_exists
+
+    - name: Restore previous release link
+      ansible.builtin.command:
+        argv: [mv, -Tf, "{{ gateway_release_root }}/current.next", "{{ gateway_release_root }}/current"]
+      when: gateway_pending.previous_release_exists
+
+    - name: Remove release link absent before cutover
+      ansible.builtin.file:
+        path: "{{ gateway_release_root }}/current"
+        state: absent
+      when: not gateway_pending.previous_release_exists
+
+    - name: Restore gateway service state
+      ansible.builtin.systemd_service:
+        name: codex-gateway.service
+        daemon_reload: true
+        enabled: "{{ gateway_pending.previous_service_enabled }}"
+        state: "{{ 'restarted' if gateway_pending.previous_service_active else 'stopped' }}"
+      become: true
+
+    - name: Determine whether the owner already restarted the app server
+      ansible.builtin.set_fact:
+        gateway_owner_restart_happened: "{{ gateway_rollback_inputs.results[2].stat.exists and (not gateway_pending.app_server_socket_before.exists or gateway_rollback_inputs.results[2].stat.inode != gateway_pending.app_server_socket_before.inode or gateway_rollback_inputs.results[2].stat.mtime != gateway_pending.app_server_socket_before.mtime or gateway_rollback_inputs.results[2].stat.ctime != gateway_pending.app_server_socket_before.ctime) }}"
+
+    - name: Request owner restart after configuration rollback
+      ansible.builtin.pause:
+        prompt: The previous Grace configuration is restored. Use the owning desktop's Restart action for Grace, wait for it to reconnect, then press Enter.
+      when: gateway_owner_restart_happened
+
+    - name: Inspect app server after rollback restart
+      ansible.builtin.stat:
+        path: "{{ gateway_app_server_socket }}"
+      register: gateway_rollback_socket_after
+      changed_when: false
+      when: gateway_owner_restart_happened
+
+    - name: Require the rollback restart
+      ansible.builtin.assert:
+        that:
+          - gateway_rollback_socket_after.stat.exists
+          - gateway_rollback_socket_after.stat.inode != gateway_rollback_inputs.results[2].stat.inode or gateway_rollback_socket_after.stat.mtime != gateway_rollback_inputs.results[2].stat.mtime or gateway_rollback_socket_after.stat.ctime != gateway_rollback_inputs.results[2].stat.ctime
+        fail_msg: Grace's app server did not restart after rollback; the recovery transaction was retained.
+      when: gateway_owner_restart_happened
+
+    - name: Inspect restored artifacts
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      loop:
+        - "{{ gateway_codex_config }}"
+        - "{{ gateway_catalog_path }}"
+        - "{{ gateway_unit_path }}"
+      register: gateway_restored_files
+      changed_when: false
+
+    - name: Read restored release
+      ansible.builtin.command:
+        argv: [readlink, "{{ gateway_release_root }}/current"]
+      register: gateway_restored_release
+      failed_when: false
+      changed_when: false
+
+    - name: Verify restored state
+      ansible.builtin.assert:
+        that:
+          - gateway_restored_files.results[0].stat.checksum == gateway_pending.previous_config_sha256
+          - gateway_restored_files.results[1].stat.exists == gateway_pending.previous_catalog_exists
+          - gateway_restored_files.results[2].stat.exists == gateway_pending.previous_unit_exists
+          - not gateway_pending.previous_catalog_exists or gateway_restored_files.results[1].stat.checksum == gateway_pending.previous_catalog_sha256
+          - not gateway_pending.previous_unit_exists or gateway_restored_files.results[2].stat.checksum == gateway_pending.previous_unit_sha256
+          - (gateway_pending.previous_release_exists and gateway_restored_release.rc == 0) or (not gateway_pending.previous_release_exists and gateway_restored_release.rc != 0)
+          - not gateway_pending.previous_release_exists or gateway_restored_release.stdout == gateway_pending.previous_release
+
+    - name: Remove verified rollback transaction
+      ansible.builtin.file:
+        path: "{{ gateway_pending.transaction_path }}"
+        state: absent
+      changed_when: false
+
+    - name: Remove rolled back pending cutover
+      ansible.builtin.file:
+        path: "{{ gateway_pending_path }}"
+        state: absent
+      changed_when: false

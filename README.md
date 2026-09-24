@@ -32,6 +32,8 @@ mise exec -- go test ./...
 uv run --no-project adapters/chatgpt/test_stream.py
 mise exec -- go build -o /tmp/codex-gateway ./cmd/codex-gateway
 ansible-playbook --syntax-check deploy/codex-gateway.yml
+ansible-playbook --syntax-check deploy/finalize-cutover.yml
+ansible-playbook --syntax-check deploy/rollback-cutover.yml
 ansible-inventory --graph
 ```
 
@@ -45,11 +47,13 @@ ansible-playbook deploy/codex-gateway.yml --limit grace-agent --check --diff
 After separate authorization for the live cutover:
 
 ```sh
-ansible-playbook deploy/codex-gateway.yml --limit grace-agent
+bin/deploy-grace prepare
+# Use the owning desktop's Restart action for the Grace connection.
+bin/deploy-grace finalize
 curl --fail http://127.0.0.1:48766/ready
 codex debug models
 ```
 
-The live transaction stages a binary tied to the source commit and a validated catalog, installs `codex-gateway.service`, waits for readiness, then puts `openai_base_url` and the HTTP ChatGPT provider in a marked block at the top of Grace's `~/.codex/config.toml`. A configuration change restarts Grace's Codex app server once; catalog-only changes propagate through ETags without a restart. It validates `/v1/models` discovery and writes `~/.local/state/codex-gateway/receipt.json`. On an activation failure, it restores the previous binary link, catalog, config, service unit, service state, and Codex app-server configuration, then fails. The recovery transaction is removed after verified restoration and retained only if restoration cannot be verified. Repeating an unchanged release should report zero changes.
+The live transaction stages a binary tied to the source commit and a validated catalog, installs `codex-gateway.service`, waits for readiness, then puts `openai_base_url` and the HTTP ChatGPT provider in a marked block at the top of Grace's `~/.codex/config.toml`. When that configuration changes under an externally owned app server, `prepare` retains the recovery transaction until the owner restarts Grace's connection and `finalize` proves the process was replaced. A daemon-managed server restarts automatically. Catalog-only changes propagate through ETags without a restart. Finalization validates `/v1/models` discovery and writes `~/.local/state/codex-gateway/receipt.json`. A prepare failure restores the previous binary link, catalog, config, unit, and service state. Use `bin/deploy-grace rollback` to restore a prepared cutover that cannot be finalized. Repeating an unchanged release should report zero changes.
 
 Managed paths are `~/.local/share/codex-gateway/`, `~/.local/state/codex-gateway/`, the marked gateway block in `~/.codex/config.toml`, and `/etc/systemd/system/codex-gateway.service`. The playbook does not own other files in those parent directories. For deliberate rollback after a successful deployment, check out the previous committed release and deploy it; catalog regeneration and `model/list` validation still apply. Grace is the sole v0 target. XPS client routing and ledger changes are later decisions.
