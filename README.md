@@ -13,6 +13,7 @@ The gateway listens on `127.0.0.1:48766`. It uses Grace's existing `~/.codex/aut
 | `internal/catalog/` | Subscription roster fetch and merged catalog validation |
 | `internal/verify/` | Fresh Codex app-server `model/list` deployment gate |
 | `adapter/` | Go adapter contract |
+| `websearch/` | Opt-in ChatGPT-hosted web search loop for routed adapters |
 | `adapters/<provider>/` | Provider-specific implementation; `adapters/chatgpt/` is the first live adapter |
 | `app/` and `cmd/codex-gateway/` | Static registration and executable |
 | `deploy/` | Grace inventory, service, transaction, and rollback |
@@ -20,6 +21,16 @@ The gateway listens on `127.0.0.1:48766`. It uses Grace's existing `~/.codex/aut
 Adapters are ordinary Go packages linked at build time. An adapter owns a namespace such as `modal`, declares Codex catalog metadata with slugs such as `modal/model-name`, and implements HTTP Responses translation. Register it in `cmd/codex-gateway/main.go` by passing its value to `app.Run(ctx, os.Args[1:], adapterValue)`. Registration affects both request routing and catalog generation. Add the implementation, tests, and registration in one commit; deploy that commit; regenerate the catalog; and verify a **fresh** Codex `model/list` before routing everyday Codex through it. The Ansible playbook performs the catalog refresh and fresh `model/list` gate on every deployment. The verifier checks every listable catalog model. A later unused provider can remain in source without being registered; it is then absent from the binary and catalog. There is no runtime adapter loader. Private adapters used for deployment should live in a private Git repository or private branch with an exact committed source revision; ignored deployment code would defeat release reproducibility.
 
 The first adapter exposes `subscription-chatgpt/chatgpt` as **Subscription ChatGPT**, with Instant, Thinking Light/Standard/Extended/Heavy, and Pro Standard mapped to Codex efforts `none`, `low`, `medium`, `high`, `xhigh`, and `max`. It uses Grace's existing login and an isolated helper for ChatGPT's consumer conversation protocol. See [the adapter README](adapters/chatgpt/README.md) for the protocol boundary and current limits. Native subscription traffic remains byte preserving. Namespaced WebSocket requests are rejected until an adapter explicitly supports that transport.
+
+Routed adapters may opt into `websearch.Service` to expose Codex's hosted
+`web_search` declaration as an ordinary function tool to their model. The
+service intercepts that function call, executes the real hosted search through
+Grace's existing ChatGPT subscription, injects bounded untrusted results, and
+continues the routed model for its final answer. The default helper is
+`gpt-5.6-luna` at low reasoning with a three-search turn limit. Subscription
+credentials are restricted to ChatGPT and are never sent to the routed model's
+provider. Merely compiling the package does not advertise search; an adapter
+must wrap its Responses transport and set the corresponding catalog capability.
 
 The installed `chatgpt_gateway` Codex provider uses HTTP Responses for this adapter while the default `openai` provider keeps native WebSockets. Select ChatGPT with `codex -m subscription-chatgpt/chatgpt -c model_provider=chatgpt_gateway -c model_reasoning_effort=none`. Change the effort to `low`, `medium`, `high`, `xhigh`, or `max` for Thinking and Pro. Selecting the model under the default provider still works after Codex falls back from WebSockets, but adds retry warnings and delay.
 
