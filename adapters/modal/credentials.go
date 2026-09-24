@@ -22,8 +22,10 @@ func (a Adapter) token() (string, error) {
 	if path := os.Getenv("MODAL_INFERENCE_TOKEN_FILE"); path != "" {
 		paths = append(paths, path)
 	}
+	systemdCredentialPath := ""
 	if directory := os.Getenv("CREDENTIALS_DIRECTORY"); directory != "" {
-		paths = append(paths, filepath.Join(directory, tokenCredentialName))
+		systemdCredentialPath = filepath.Join(directory, tokenCredentialName)
+		paths = append(paths, systemdCredentialPath)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		paths = append(paths,
@@ -44,7 +46,15 @@ func (a Adapter) token() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("read Modal credential: %w", err)
 		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		permissions := info.Mode().Perm()
+		private := permissions&0o077 == 0
+		if path == systemdCredentialPath {
+			// systemd credentials are exposed from a protected, service-private
+			// mount as 0440. Group-read is intentional there; group write/execute
+			// and every permission for other users remain forbidden.
+			private = permissions&0o037 == 0
+		}
+		if !info.Mode().IsRegular() || !private {
 			return "", errors.New("read Modal credential: credential file must be private and regular")
 		}
 		data, err := os.ReadFile(path)

@@ -52,3 +52,24 @@ func TestTokenRequiresPrivateFile(t *testing.T) {
 		t.Fatalf("private credential = %q, %v", got, err)
 	}
 }
+
+func TestTokenAcceptsSystemdCredentialMode(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, tokenCredentialName)
+	if err := os.WriteFile(path, []byte("wk.ws\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", directory)
+	if got, err := (Adapter{}).token(); err != nil || got != "wk.ws" {
+		t.Fatalf("systemd credential = %q, %v", got, err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Adapter{}).token(); err == nil {
+		t.Fatal("accepted a world-readable systemd credential")
+	}
+}
