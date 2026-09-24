@@ -10,12 +10,14 @@
     gateway_state_root: "{{ gateway_home }}/.local/state/codex-gateway"
     gateway_catalog_path: "{{ gateway_state_root }}/model-catalog.json"
     gateway_pending_path: "{{ gateway_state_root }}/pending-cutover.json"
+    gateway_modal_credential_path: /etc/credstore.encrypted/codex-gateway-modal
     gateway_codex_config: "{{ gateway_home }}/.codex/config.toml"
     gateway_app_server_socket: "{{ gateway_home }}/.codex/app-server-control/app-server-control.sock"
     gateway_unit_path: "{{ (gateway_state_root + '/codex-gateway.service') if gateway_test_mode else '/etc/systemd/system/codex-gateway.service' }}"
     gateway_config_block: |
       openai_base_url = "http://127.0.0.1:48766/v1"
       model_providers.chatgpt_gateway = { name = "ChatGPT Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses" }
+      model_providers.modal_gateway = { name = "Modal Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses", request_max_retries = 0, stream_max_retries = 0 }
   tasks:
     - name: Read target identity
       ansible.builtin.command:
@@ -87,6 +89,25 @@
       ansible.builtin.assert:
         that: gateway_git_status.stdout == ''
         fail_msg: Commit all gateway source before preview or deployment.
+
+    - name: Inspect Modal inference credential
+      ansible.builtin.stat:
+        path: "{{ gateway_modal_credential_path }}"
+      register: gateway_modal_credential
+      changed_when: false
+      check_mode: false
+      become: true
+      when: not gateway_test_mode
+
+    - name: Require a private Modal inference credential for live deployment
+      ansible.builtin.assert:
+        that:
+          - gateway_modal_credential.stat.exists
+          - gateway_modal_credential.stat.isreg | default(false)
+          - (gateway_modal_credential.stat.pw_name | default('')) == 'root'
+          - (gateway_modal_credential.stat.mode | default('')) == '0600'
+        fail_msg: Provision a root-owned mode-0600 encrypted Modal credential at {{ gateway_modal_credential_path }} before live deployment.
+      when: not ansible_check_mode and not gateway_test_mode
 
     - name: Read exact source commit
       ansible.builtin.command:

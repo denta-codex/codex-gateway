@@ -8,13 +8,14 @@ import (
 	"syscall"
 
 	"github.com/denta-codex/codex-gateway/adapters/chatgpt"
+	"github.com/denta-codex/codex-gateway/adapters/modal"
 	"github.com/denta-codex/codex-gateway/app"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := app.Run(ctx, os.Args[1:], &chatgpt.Adapter{}); err != nil {
+	if err := app.Run(ctx, os.Args[1:], &chatgpt.Adapter{}, &modal.Adapter{}); err != nil {
 		log.Fatal(err)
 	}
 }

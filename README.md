@@ -14,7 +14,7 @@ The gateway listens on `127.0.0.1:48766`. It uses Grace's existing `~/.codex/aut
 | `internal/verify/` | Fresh Codex app-server `model/list` deployment gate |
 | `adapter/` | Go adapter contract |
 | `websearch/` | Opt-in ChatGPT-hosted web search loop for routed adapters |
-| `adapters/<provider>/` | Provider-specific implementation; `adapters/chatgpt/` is the first live adapter |
+| `adapters/<provider>/` | Provider-specific implementation; ChatGPT and Modal are linked into the production binary |
 | `app/` and `cmd/codex-gateway/` | Static registration and executable |
 | `deploy/` | Grace inventory, service, transaction, and rollback |
 
@@ -32,7 +32,22 @@ credentials are restricted to ChatGPT and are never sent to the routed model's
 provider. Merely compiling the package does not advertise search; an adapter
 must wrap its Responses transport and set the corresponding catalog capability.
 
+The Modal adapter exposes DeepSeek V4.1 Flash, GLM 5.3 Flash, and Kimi K3 under the `modal/`
+namespace. Codex sends Responses to the loopback gateway; the adapter translates
+them to streaming Chat Completions and remaps reasoning, text, tool calls, and
+usage into Responses events. It supports function, custom, namespace, deferred,
+parallel, and image inputs, and fails closed on malformed or truncated tool
+streams. See [the Modal adapter README](adapters/modal/README.md) for the mapping,
+credential locations, and deliberate limits.
+
 The installed `chatgpt_gateway` Codex provider uses HTTP Responses for this adapter while the default `openai` provider keeps native WebSockets. Select ChatGPT with `codex -m subscription-chatgpt/chatgpt -c model_provider=chatgpt_gateway -c model_reasoning_effort=none`. Change the effort to `low`, `medium`, `high`, `xhigh`, or `max` for Thinking and Pro. Selecting the model under the default provider still works after Codex falls back from WebSockets, but adds retry warnings and delay.
+
+The installed `modal_gateway` provider uses the same loopback endpoint with
+WebSockets and client-side retries disabled; the adapter owns one safe pre-stream
+retry. Live deployment requires the root-owned, mode-0600 systemd encrypted
+credential `/etc/credstore.encrypted/codex-gateway-modal`; the service exposes it
+only as `modal-inference-token` in its private credentials directory. Select a Modal model with
+`codex -m modal/ENDPOINT_ID -c model_provider=modal_gateway`.
 
 ## Local checks
 
@@ -67,4 +82,4 @@ codex debug models
 
 The live transaction stages a binary tied to the source commit and a validated catalog, installs `codex-gateway.service`, waits for readiness, then puts `openai_base_url` and the HTTP ChatGPT provider in a marked block at the top of Grace's `~/.codex/config.toml`. When that configuration changes under an externally owned app server, `prepare` retains the recovery transaction until the owner restarts Grace's connection and `finalize` proves the process was replaced. A daemon-managed server restarts automatically. Catalog-only changes propagate through ETags without a restart. Finalization validates `/v1/models` discovery and writes `~/.local/state/codex-gateway/receipt.json`. A prepare failure restores the previous binary link, catalog, config, unit, and service state. Use `bin/deploy-grace rollback` to restore a prepared cutover that cannot be finalized. Repeating an unchanged release should report zero changes.
 
-Managed paths are `~/.local/share/codex-gateway/`, `~/.local/state/codex-gateway/`, the marked gateway block in `~/.codex/config.toml`, and `/etc/systemd/system/codex-gateway.service`. The playbook does not own other files in those parent directories. For deliberate rollback after a successful deployment, check out the previous committed release and deploy it; catalog regeneration and `model/list` validation still apply. Grace is the sole v0 target. XPS client routing and ledger changes are later decisions.
+Managed paths are `~/.local/share/codex-gateway/`, `~/.local/state/codex-gateway/`, the marked gateway block in `~/.codex/config.toml`, `/etc/credstore.encrypted/codex-gateway-modal`, and `/etc/systemd/system/codex-gateway.service`. The playbook does not own other files in those parent directories. For deliberate rollback after a successful deployment, check out the previous committed release and deploy it; catalog regeneration and `model/list` validation still apply. Grace is the sole v0 target. XPS client routing and ledger changes are later decisions.

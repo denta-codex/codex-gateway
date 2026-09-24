@@ -12,6 +12,7 @@ import (
 	"github.com/denta-codex/codex-gateway/adapter"
 	"github.com/denta-codex/codex-gateway/adapters/chatgpt"
 	"github.com/denta-codex/codex-gateway/adapters/example"
+	"github.com/denta-codex/codex-gateway/adapters/modal"
 )
 
 func TestMergeAndKeepLastGoodCatalog(t *testing.T) {
@@ -33,6 +34,34 @@ func TestMergeAndKeepLastGoodCatalog(t *testing.T) {
 	last, _ := os.ReadFile(path)
 	if string(last) != string(first) {
 		t.Fatal("failed refresh replaced last good catalog")
+	}
+}
+
+func TestModalUsesNativeSchemaWithoutNativeIdentity(t *testing.T) {
+	native := []byte(`{"models":[{"slug":"native","visibility":"list","priority":1,"base_instructions":"You are NativeGPT","model_messages":{"instructions_template":"native-only"},"supports_search_tool":true,"web_search_tool_type":"text_and_image","future_schema_field":{"keep":true}}]}`)
+	merged, err := Merge(native, []adapter.Adapter{modal.Adapter{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Models []map[string]json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(merged, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1+len(modal.Adapter{}.Models()) {
+		t.Fatalf("models=%d", len(catalog.Models))
+	}
+	for _, row := range catalog.Models[1:] {
+		if strings.Contains(string(row["base_instructions"]), "NativeGPT") || strings.Contains(string(row["model_messages"]), "native-only") {
+			t.Fatal("native model identity leaked into Modal catalog row")
+		}
+		if _, ok := row["web_search_tool_type"]; ok || string(row["supports_search_tool"]) != "false" {
+			t.Fatal("native hosted search capability leaked into Modal catalog row")
+		}
+		if !strings.Contains(string(row["future_schema_field"]), "keep") {
+			t.Fatal("future native schema field was not retained")
+		}
 	}
 }
 
