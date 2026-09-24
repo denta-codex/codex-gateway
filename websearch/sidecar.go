@@ -161,7 +161,7 @@ func parseSearchResponse(response *http.Response) (searchOutcome, error) {
 	var text string
 	var sources []source
 	failed := false
-	if strings.Contains(contentType, "text/event-stream") || bytes.HasPrefix(bytes.TrimSpace(body), []byte("data:")) {
+	if strings.Contains(contentType, "text/event-stream") || looksLikeSSE(body) {
 		output, text, sources, failed, err = parseSSE(body)
 	} else {
 		output, text, err = parseJSONResponse(body)

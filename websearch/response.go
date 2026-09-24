@@ -38,7 +38,7 @@ func readRound(response *http.Response, limit int64) (*bufferedRound, error) {
 		return round, nil
 	}
 	contentType := strings.ToLower(response.Header.Get("Content-Type"))
-	if strings.Contains(contentType, "text/event-stream") || bytes.HasPrefix(bytes.TrimSpace(body), []byte("data:")) {
+	if strings.Contains(contentType, "text/event-stream") || looksLikeSSE(body) {
 		round.output, _, _, _, err = parseSSE(body)
 	} else {
 		round.output, _, err = parseJSONResponse(body)
@@ -47,6 +47,14 @@ func readRound(response *http.Response, limit int64) (*bufferedRound, error) {
 		return nil, err
 	}
 	return round, nil
+}
+
+func looksLikeSSE(body []byte) bool {
+	prefix := bytes.TrimSpace(body)
+	if len(prefix) > 4096 {
+		prefix = prefix[:4096]
+	}
+	return bytes.HasPrefix(prefix, []byte("data:")) || bytes.HasPrefix(prefix, []byte("event:")) || bytes.Contains(prefix, []byte("\ndata:"))
 }
 
 func parseJSONResponse(body []byte) ([]map[string]any, string, error) {

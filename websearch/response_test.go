@@ -9,8 +9,8 @@ import (
 )
 
 func TestParseSearchResponseUsesCompletedTextAndSafeAnnotations(t *testing.T) {
-	body := `data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[{"type":"url_citation","title":"Primary","url":"https://example.com/source"},{"type":"url_citation","title":"Bad","url":"javascript:alert(1)"}]}]}]}}` + "\n\n"
-	response := httpResponse(http.StatusOK, "text/event-stream", body)
+	body := "event: response.completed\n" + `data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[{"type":"url_citation","title":"Primary","url":"https://example.com/source"},{"type":"url_citation","title":"Bad","url":"javascript:alert(1)"}]}]}]}}` + "\n\n"
+	response := httpResponse(http.StatusOK, "", body)
 	outcome, err := parseSearchResponse(response)
 	if err != nil || outcome.text != "answer" || len(outcome.sources) != 1 || outcome.sources[0].URL != "https://example.com/source" {
 		t.Fatalf("outcome=%#v err=%v", outcome, err)

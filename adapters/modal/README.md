@@ -14,6 +14,13 @@ Codex Responses JSON
   -> typed Responses SSE events or a collected Responses JSON object
 ```
 
+When Codex declares hosted `web_search`, the adapter exposes a synthetic
+function of that name to the Modal model. Calls are intercepted by the shared
+gateway search service, executed through Grace's ChatGPT subscription using
+`gpt-5.6-luna`, and returned to the Modal model as bounded, untrusted tool
+output before it writes the final answer. ChatGPT credentials never reach
+Modal. Ordinary turns retain the direct streaming path.
+
 The translation follows the same useful boundary as OpenCodex's `openai-chat`
 adapter: instructions and input items become Chat messages; function, custom,
 namespace, and `additional_tools` declarations become Chat functions; tool
@@ -59,5 +66,6 @@ headers without exposing the original identifier.
 The adapter requires self-contained input and rejects `previous_response_id`,
 remote compaction triggers, encrypted compaction state, input audio/video/files,
 and namespaced WebSockets. Local Codex compaction boundary markers are accepted.
-Hosted OpenAI tools are omitted because Modal cannot execute them; local
-function, custom, namespace, and deferred tools remain available.
+Hosted OpenAI tools other than the gateway-backed `web_search` capability are
+omitted because Modal cannot execute them; local function, custom, namespace,
+and deferred tools remain available.

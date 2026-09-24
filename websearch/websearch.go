@@ -116,6 +116,14 @@ type requestState struct {
 	model      string
 }
 
+// Enabled reports whether a valid Responses request declares hosted web
+// search. Adapters use it to keep their ordinary non-search streaming path
+// untouched and invoke Service only for turns that need orchestration.
+func Enabled(body []byte) (bool, error) {
+	_, enabled, err := parseRequest(body)
+	return enabled, err
+}
+
 // ServeResponses serves one Codex-facing request. Requests without a hosted
 // web_search declaration are passed to backend byte-for-byte and relayed.
 func (s *Service) ServeResponses(w http.ResponseWriter, r *http.Request, body []byte, backend Backend) {

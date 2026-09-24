@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/denta-codex/codex-gateway/adapter"
+	"github.com/denta-codex/codex-gateway/websearch"
 )
 
 const defaultBaseURL = "https://inference.us-west.modal.direct/v1"
@@ -29,12 +30,34 @@ type Adapter struct {
 	CredentialFile string
 	Token          string
 	Client         *http.Client
+	SearchClient   *http.Client
+	Auth           adapter.TokenSource
 }
 
 func (Adapter) Namespace() string       { return Namespace }
 func (Adapter) Models() []adapter.Model { return models() }
 
+func (a *Adapter) SetSubscriptionAuth(auth adapter.TokenSource) { a.Auth = auth }
+
 func (a Adapter) ServeResponses(w http.ResponseWriter, r *http.Request, body []byte) {
+	searchEnabled, _ := websearch.Enabled(body)
+	if searchEnabled {
+		service, err := websearch.New(websearch.Config{Auth: a.Auth, Client: a.SearchClient})
+		if err != nil {
+			respondAdapterError(w, http.StatusServiceUnavailable, "web_search_unavailable", "ChatGPT web search is unavailable")
+			return
+		}
+		service.ServeResponses(w, r, body, websearch.BackendFunc(func(ctx context.Context, iteration []byte) (*http.Response, error) {
+			capture := newResponseCapture()
+			a.serveResponses(capture, r.Clone(ctx), iteration)
+			return capture.response()
+		}))
+		return
+	}
+	a.serveResponses(w, r, body)
+}
+
+func (a Adapter) serveResponses(w http.ResponseWriter, r *http.Request, body []byte) {
 	translated, err := translateRequest(body)
 	if err != nil {
 		respondAdapterError(w, http.StatusBadRequest, "invalid_request", err.Error())

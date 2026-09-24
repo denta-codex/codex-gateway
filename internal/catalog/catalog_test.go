@@ -56,8 +56,8 @@ func TestModalUsesNativeSchemaWithoutNativeIdentity(t *testing.T) {
 		if strings.Contains(string(row["base_instructions"]), "NativeGPT") || strings.Contains(string(row["model_messages"]), "native-only") {
 			t.Fatal("native model identity leaked into Modal catalog row")
 		}
-		if _, ok := row["web_search_tool_type"]; ok || string(row["supports_search_tool"]) != "false" {
-			t.Fatal("native hosted search capability leaked into Modal catalog row")
+		if string(row["web_search_tool_type"]) != `"text_and_image"` || string(row["supports_search_tool"]) != "true" {
+			t.Fatal("Modal hosted search capability was not applied explicitly")
 		}
 		if !strings.Contains(string(row["future_schema_field"]), "keep") {
 			t.Fatal("future native schema field was not retained")

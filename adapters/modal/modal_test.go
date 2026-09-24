@@ -1,6 +1,7 @@
 package modal
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,12 @@ import (
 	"sync"
 	"testing"
 )
+
+type testSubscriptionAuth struct{}
+
+func (testSubscriptionAuth) Token(context.Context) (string, string, error) {
+	return "chatgpt-token", "chatgpt-account", nil
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -108,8 +115,67 @@ func TestModelsAreNamespacedAndUnique(t *testing.T) {
 			t.Fatalf("invalid model entry: %#v", model)
 		}
 		seen[model.Slug] = true
+		var catalog map[string]any
+		if err := json.Unmarshal(model.Catalog, &catalog); err != nil || catalog["supports_search_tool"] != true || catalog["web_search_tool_type"] != "text_and_image" {
+			t.Fatalf("model does not advertise hosted search: %v %#v", err, catalog)
+		}
 	}
 	if len(seen) != len(modelSpecs) {
 		t.Fatalf("got %d models, want %d", len(seen), len(modelSpecs))
+	}
+}
+
+func TestAdapterRunsHostedSearchThroughSubscription(t *testing.T) {
+	t.Parallel()
+	modalRounds := 0
+	modalClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		modalRounds++
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if modalRounds == 1 {
+			if !strings.Contains(string(body), `"name":"web_search"`) {
+				t.Fatalf("synthetic web_search was not sent to Modal: %s", body)
+			}
+			sse := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_search","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"latest Modal news\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n\n"
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sse)), Header: make(http.Header)}, nil
+		}
+		if !strings.Contains(string(body), "UNTRUSTED web content") || !strings.Contains(string(body), "https://example.com/current") {
+			t.Fatalf("search result was not returned to Modal: %s", body)
+		}
+		sse := `data: {"choices":[{"delta":{"content":"Final answer from GLM with sources."},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sse)), Header: make(http.Header)}, nil
+	})}
+
+	searchRequests := 0
+	searchClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		searchRequests++
+		if request.URL.String() != "https://chatgpt.com/backend-api/codex/responses" || request.Header.Get("Authorization") != "Bearer chatgpt-token" || request.Header.Get("Chatgpt-Account-Id") != "chatgpt-account" {
+			t.Fatalf("invalid ChatGPT search request: %s %#v", request.URL, request.Header)
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), `"model":"gpt-5.6-luna"`) || !strings.Contains(string(body), `"store":false`) || !strings.Contains(string(body), `"type":"web_search"`) {
+			t.Fatalf("invalid ChatGPT sidecar body: %s", body)
+		}
+		sse := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Current information.\\nSources:\\n- Current: https://example.com/current\"}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(sse)), Header: http.Header{"Content-Type": []string{"text/event-stream"}}}, nil
+	})}
+
+	modalAdapter := &Adapter{BaseURL: "https://modal.invalid/v1", Token: "wk.ws", Client: modalClient, SearchClient: searchClient}
+	modalAdapter.SetSubscriptionAuth(testSubscriptionAuth{})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := []byte(`{"model":"modal/` + GLMFlashModel + `","input":"What changed?","stream":false,"tools":[{"type":"web_search","search_context_size":"high"}]}`)
+	modalAdapter.ServeResponses(recorder, request, body)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Final answer from GLM") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if modalRounds != 2 || searchRequests != 1 {
+		t.Fatalf("Modal rounds=%d ChatGPT searches=%d", modalRounds, searchRequests)
 	}
 }
