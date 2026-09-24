@@ -13,7 +13,7 @@ The gateway listens on `127.0.0.1:48766`. It uses Grace's existing `~/.codex/aut
 | `internal/catalog/` | Subscription roster fetch and merged catalog validation |
 | `internal/verify/` | Fresh Codex app-server `model/list` deployment gate |
 | `adapter/` | Go adapter contract |
-| `adapters/<provider>/` | Provider-specific implementation; `adapters/chatgpt/` is the first live adapter |
+| `adapters/<provider>/` | Provider-specific implementation; ChatGPT and Modal are linked into the production binary |
 | `app/` and `cmd/codex-gateway/` | Static registration and executable |
 | `deploy/` | Grace inventory, service, transaction, and rollback |
 
@@ -21,7 +21,21 @@ Adapters are ordinary Go packages linked at build time. An adapter owns a namesp
 
 The first adapter exposes `subscription-chatgpt/chatgpt` as **Subscription ChatGPT**, with Instant, Thinking Light/Standard/Extended/Heavy, and Pro Standard mapped to Codex efforts `none`, `low`, `medium`, `high`, `xhigh`, and `max`. It uses Grace's existing login and an isolated helper for ChatGPT's consumer conversation protocol. See [the adapter README](adapters/chatgpt/README.md) for the protocol boundary and current limits. Native subscription traffic remains byte preserving. Namespaced WebSocket requests are rejected until an adapter explicitly supports that transport.
 
+The Modal adapter exposes the five managed Modal endpoints under the `modal/`
+namespace. Codex sends Responses to the loopback gateway; the adapter translates
+them to streaming Chat Completions and remaps reasoning, text, tool calls, and
+usage into Responses events. It supports function, custom, namespace, deferred,
+parallel, and image inputs, and fails closed on malformed or truncated tool
+streams. See [the Modal adapter README](adapters/modal/README.md) for the mapping,
+credential locations, and deliberate limits.
+
 The installed `chatgpt_gateway` Codex provider uses HTTP Responses for this adapter while the default `openai` provider keeps native WebSockets. Select ChatGPT with `codex -m subscription-chatgpt/chatgpt -c model_provider=chatgpt_gateway -c model_reasoning_effort=none`. Change the effort to `low`, `medium`, `high`, `xhigh`, or `max` for Thinking and Pro. Selecting the model under the default provider still works after Codex falls back from WebSockets, but adds retry warnings and delay.
+
+The installed `modal_gateway` provider uses the same loopback endpoint with
+WebSockets and client-side retries disabled; the adapter owns one safe pre-stream
+retry. Before live deployment, provision a mode-0600
+`~/.config/codex-gateway/modal.env`. Select a Modal model with
+`codex -m modal/ENDPOINT_ID -c model_provider=modal_gateway`.
 
 ## Local checks
 
