@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/denta-codex/codex-gateway/adapters/example"
+	"github.com/denta-codex/codex-gateway/internal/catalog"
 	"github.com/denta-codex/codex-gateway/internal/subscription"
 	"github.com/klauspost/compress/zstd"
 )
@@ -36,6 +37,80 @@ func testCatalog(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestCatalogETagAndConditionalRequest(t *testing.T) {
+	path := testCatalog(t)
+	g, err := New(Config{CatalogPath: path, Auth: testAuth(t), Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(g)
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/v1/models?client_version=test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstETag := response.Header.Get("ETag")
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || firstETag == "" || response.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatalf("status=%d etag=%q cache=%q", response.StatusCode, firstETag, response.Header.Get("Cache-Control"))
+	}
+
+	request, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+	request.Header.Set("If-None-Match", firstETag)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional status=%d", response.StatusCode)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"models":[{"slug":"gpt-6-sol"},{"slug":"new/model"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("ETag") == firstETag {
+		t.Fatalf("updated status=%d etag=%q", response.StatusCode, response.Header.Get("ETag"))
+	}
+}
+
+func TestResponsesCarryInstalledCatalogETag(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Models-Etag", `"upstream"`)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+	}))
+	defer upstream.Close()
+	path := testCatalog(t)
+	snapshot, err := catalog.ReadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := New(Config{UpstreamBase: upstream.URL, CatalogPath: path, Auth: testAuth(t), Client: upstream.Client(), Logger: log.New(io.Discard, "", 0)}, example.Adapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(g)
+	defer server.Close()
+
+	for _, model := range []string{"gpt-6-sol", "example/echo"} {
+		response, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"`+model+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || response.Header.Get("X-Models-Etag") != snapshot.ETag {
+			t.Fatalf("model=%s status=%d etag=%q", model, response.StatusCode, response.Header.Get("X-Models-Etag"))
+		}
+	}
 }
 
 func TestSubscriptionPassthroughAndFallback(t *testing.T) {
@@ -231,5 +306,57 @@ func TestNativeWebSocketPassthrough(t *testing.T) {
 	}
 	if !bytes.Equal(echo, message) {
 		t.Fatalf("WebSocket changed message: %q", echo)
+	}
+}
+
+func TestNativeWebSocketRewritesModelsETagMetadata(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.CloseNow()
+		if _, _, err := conn.Read(context.Background()); err != nil {
+			t.Error(err)
+			return
+		}
+		metadata := []byte(`{"type":"codex.response.metadata","headers":{"X-Models-Etag":"upstream","x-other":"keep"},"sequence_number":1}`)
+		if err := conn.Write(context.Background(), websocket.MessageText, metadata); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer upstream.Close()
+	path := testCatalog(t)
+	snapshot, err := catalog.ReadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := New(Config{UpstreamBase: upstream.URL, CatalogPath: path, Auth: testAuth(t), Client: upstream.Client(), Logger: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(g)
+	defer server.Close()
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"response.create","model":"gpt-6-sol"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := conn.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata struct {
+		Headers map[string]string `json:"headers"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Headers["x-models-etag"] != snapshot.ETag || metadata.Headers["x-other"] != "keep" {
+		t.Fatalf("metadata=%s", data)
 	}
 }

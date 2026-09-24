@@ -37,6 +37,10 @@ Production reads the first available private regular file from:
 3. `~/.config/codex-gateway/modal.env`
 4. the legacy `~/.config/codex-modal-proxy/credentials.env`
 
+The Grace service uses option 2. Its source is the TPM/host-encrypted,
+root-owned `/etc/credstore.encrypted/codex-gateway-modal`; systemd decrypts it
+into the service's private credentials directory at startup.
+
 The file must not be group- or world-readable. It may contain the combined
 `wk-....ws-...` token directly, `MODAL_PROXY_TOKEN=...`, or the original pair:
 

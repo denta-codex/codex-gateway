@@ -10,10 +10,8 @@ const (
 	Namespace = "modal"
 
 	DeepSeekModel = "andrew-61005--ep-codex-tasks-shared-deepseek-server.us-west.modal.direct"
-	GLMFullModel  = "andrew-61005--ep-codex-tasks-shared-glm-full-server.us-west.modal.direct"
 	GLMFlashModel = "andrew-61005--ep-codex-tasks-shared-glm-server.us-west.modal.direct"
 	KimiModel     = "andrew-61005--ep-codex-tasks-shared-kimi-server.us-west.modal.direct"
-	QwenModel     = "andrew-61005--ep-codex-tasks-shared-qwen-server.us-west.modal.direct"
 )
 
 type modelSpec struct {
@@ -27,10 +25,8 @@ type modelSpec struct {
 
 var modelSpecs = []modelSpec{
 	{DeepSeekModel, "DeepSeek V4.1 Flash", `["text","image"]`, 1_048_576, []string{"none", "low", "high", "xhigh", "max"}, "high"},
-	{GLMFullModel, "GLM 5.3", `["text"]`, 1_048_576, []string{"low", "high", "max"}, "high"},
 	{GLMFlashModel, "GLM 5.3 Flash", `["text","image"]`, 1_048_576, []string{"low", "high", "max"}, "high"},
 	{KimiModel, "Kimi K3", `["text","image"]`, 1_048_576, []string{"low", "high", "max"}, "high"},
-	{QwenModel, "Qwen3.8 2.4T A95B", `["text"]`, 1_000_000, []string{"low", "medium", "xhigh"}, "medium"},
 }
 
 func models() []adapter.Model {

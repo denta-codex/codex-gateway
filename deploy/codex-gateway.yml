@@ -9,12 +9,13 @@
     gateway_release_dir: "{{ gateway_release_root }}/releases/{{ gateway_commit.stdout }}"
     gateway_state_root: "{{ gateway_home }}/.local/state/codex-gateway"
     gateway_catalog_path: "{{ gateway_state_root }}/model-catalog.json"
-    gateway_modal_credential_path: "{{ gateway_home }}/.config/codex-gateway/modal.env"
+    gateway_pending_path: "{{ gateway_state_root }}/pending-cutover.json"
+    gateway_modal_credential_path: /etc/credstore.encrypted/codex-gateway-modal
     gateway_codex_config: "{{ gateway_home }}/.codex/config.toml"
+    gateway_app_server_socket: "{{ gateway_home }}/.codex/app-server-control/app-server-control.sock"
     gateway_unit_path: "{{ (gateway_state_root + '/codex-gateway.service') if gateway_test_mode else '/etc/systemd/system/codex-gateway.service' }}"
     gateway_config_block: |
       openai_base_url = "http://127.0.0.1:48766/v1"
-      model_catalog_json = "{{ gateway_catalog_path }}"
       model_providers.chatgpt_gateway = { name = "ChatGPT Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses" }
       model_providers.modal_gateway = { name = "Modal Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses", request_max_retries = 0, stream_max_retries = 0 }
   tasks:
@@ -33,6 +34,48 @@
           - gateway_release_root == gateway_home + '/.local/share/codex-gateway'
           - gateway_catalog_path == gateway_home + '/.local/state/codex-gateway/model-catalog.json'
           - not gateway_test_mode or gateway_home is match('^/tmp/codex-gateway-disposable-[^/]+$')
+
+    - name: Require the prepare interface for a live deployment
+      ansible.builtin.assert:
+        that: (gateway_cutover_phase | default('')) == 'prepare'
+        fail_msg: Run bin/deploy-grace prepare for a live deployment.
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Check for an unfinished cutover
+      ansible.builtin.stat:
+        path: "{{ gateway_pending_path }}"
+      register: gateway_existing_pending
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Refuse to overwrite an unfinished cutover
+      ansible.builtin.assert:
+        that: not gateway_existing_pending.stat.exists
+        fail_msg: An unfinished cutover exists. Run bin/deploy-grace finalize or bin/deploy-grace rollback.
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Inspect Codex app server ownership
+      ansible.builtin.command:
+        argv: ["{{ gateway_codex_binary }}", app-server, daemon, version]
+      register: gateway_codex_daemon_version
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Inspect Codex app server socket before cutover
+      ansible.builtin.stat:
+        path: "{{ gateway_app_server_socket }}"
+      register: gateway_app_server_socket_before
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode and not gateway_test_mode
+
+    - name: Record Codex app server ownership
+      ansible.builtin.set_fact:
+        gateway_codex_daemon_info: "{{ gateway_codex_daemon_version.stdout | from_json }}"
+        gateway_codex_daemon_managed: "{{ (gateway_codex_daemon_version.stdout | from_json).status == 'running' and ((gateway_codex_daemon_version.stdout | from_json).backend | default('') | length) > 0 }}"
+      when: not ansible_check_mode and not gateway_test_mode
 
     - name: Require a clean committed source tree
       ansible.builtin.command:
@@ -59,10 +102,10 @@
         that:
           - gateway_modal_credential.stat.exists
           - gateway_modal_credential.stat.isreg | default(false)
-          - (gateway_modal_credential.stat.pw_name | default('')) == gateway_expected_user
+          - (gateway_modal_credential.stat.pw_name | default('')) == 'root'
           - (gateway_modal_credential.stat.mode | default('')) == '0600'
-        fail_msg: Provision a mode-0600 {{ gateway_modal_credential_path }} owned by {{ gateway_expected_user }} before live deployment.
-      when: not ansible_check_mode
+        fail_msg: Provision a root-owned mode-0600 encrypted Modal credential at {{ gateway_modal_credential_path }} before live deployment.
+      when: not ansible_check_mode and not gateway_test_mode
 
     - name: Read exact source commit
       ansible.builtin.command:
@@ -127,7 +170,7 @@
 
     - name: Verify candidate with fresh Codex model/list
       ansible.builtin.command:
-        argv: ["{{ gateway_build_dir.path }}/codex-gateway", verify-model-list, --catalog, "{{ gateway_build_dir.path }}/model-catalog.json", --codex-binary, "{{ gateway_codex_binary }}"]
+        argv: ["{{ gateway_build_dir.path }}/codex-gateway", verify-model-list, --catalog, "{{ gateway_build_dir.path }}/model-catalog.json", --auth-file, "{{ gateway_home }}/.codex/auth.json", --codex-binary, "{{ gateway_codex_binary }}"]
       environment:
         CODEX_HOME: "{{ gateway_build_dir.path }}/codex-home"
       changed_when: false
@@ -352,9 +395,19 @@
             block: "{{ gateway_config_block }}"
           register: gateway_codex_config_change
 
-        - name: Verify activated catalog with fresh Codex model/list
+        - name: Record whether the cutover needs an owner restart
+          ansible.builtin.set_fact:
+            gateway_cutover_pending: "{{ gateway_codex_config_change.changed and not gateway_test_mode and not (gateway_codex_daemon_managed | default(false)) }}"
+
+        - name: Restart a daemon-managed Codex app server after configuration cutover
           ansible.builtin.command:
-            argv: ["{{ gateway_release_root }}/current/codex-gateway", verify-model-list, --catalog, "{{ gateway_catalog_path }}", --codex-binary, "{{ gateway_codex_binary }}"]
+            argv: ["{{ gateway_codex_binary }}", app-server, daemon, restart]
+          register: gateway_codex_managed_restart
+          when: gateway_codex_config_change.changed and not gateway_test_mode and (gateway_codex_daemon_managed | default(false))
+
+        - name: Verify activated gateway discovery with fresh Codex model/list
+          ansible.builtin.command:
+            argv: ["{{ gateway_release_root }}/current/codex-gateway", verify-model-list, --catalog, "{{ gateway_catalog_path }}", --auth-file, "{{ gateway_home }}/.codex/auth.json", --discovery-base-url, "http://127.0.0.1:48766/v1", --codex-binary, "{{ gateway_codex_binary }}"]
           environment:
             CODEX_HOME: "{{ gateway_build_dir.path }}/codex-home"
           changed_when: false
@@ -377,11 +430,31 @@
             msg: Deliberate disposable rollback test failure.
           when: gateway_test_mode and (gateway_force_fail_after_activation | default(false) | bool)
 
+        - name: Inspect activated artifacts
+          ansible.builtin.stat:
+            path: "{{ item }}"
+            checksum_algorithm: sha256
+          loop:
+            - "{{ gateway_release_root }}/current/codex-gateway"
+            - "{{ gateway_catalog_path }}"
+            - "{{ gateway_codex_config }}"
+            - "{{ gateway_unit_path }}"
+          register: gateway_activated_files
+          changed_when: false
+
+        - name: Record pending owner restart
+          ansible.builtin.copy:
+            dest: "{{ gateway_pending_path }}"
+            mode: '0600'
+            content: "{{ {'version': 1, 'commit': gateway_commit.stdout, 'host': gateway_expected_hostname, 'account': gateway_expected_user, 'transaction_path': gateway_transaction.path, 'binary_sha256': gateway_activated_files.results[0].stat.checksum, 'catalog_sha256': gateway_activated_files.results[1].stat.checksum, 'config_sha256': gateway_activated_files.results[2].stat.checksum, 'unit_sha256': gateway_activated_files.results[3].stat.checksum, 'previous_release': gateway_previous_release.stdout if gateway_previous_release.rc == 0 else '', 'previous_release_exists': gateway_previous_release.rc == 0, 'previous_service_active': gateway_previous_active.stdout == 'active', 'previous_service_enabled': gateway_previous_enabled.stdout == 'enabled', 'previous_catalog_exists': gateway_previous_files.results[0].stat.exists, 'previous_catalog_sha256': gateway_previous_files.results[0].stat.checksum | default(''), 'previous_config_sha256': gateway_previous_files.results[1].stat.checksum, 'previous_unit_exists': gateway_previous_files.results[2].stat.exists, 'previous_unit_sha256': gateway_previous_files.results[2].stat.checksum | default(''), 'app_server_socket_before': {'exists': gateway_app_server_socket_before.stat.exists, 'inode': gateway_app_server_socket_before.stat.inode | default(0), 'mtime': gateway_app_server_socket_before.stat.mtime | default(0), 'ctime': gateway_app_server_socket_before.stat.ctime | default(0)}} | to_nice_json }}\n"
+          when: gateway_cutover_pending | default(false)
+
         - name: Record successful release
           ansible.builtin.copy:
             dest: "{{ gateway_state_root }}/receipt.json"
             mode: '0600'
             content: "{{ {'commit': gateway_commit.stdout, 'binary_sha256': gateway_checksums.results[0].stat.checksum, 'catalog_sha256': gateway_checksums.results[2].stat.checksum, 'host': gateway_expected_hostname, 'account': gateway_expected_user} | to_nice_json }}\n"
+          when: not (gateway_cutover_pending | default(false))
 
       rescue:
         - name: Restore previous Codex configuration
@@ -447,6 +520,11 @@
           become: true
           when: not gateway_test_mode
 
+        - name: Restart daemon-managed Codex app server with restored configuration
+          ansible.builtin.command:
+            argv: ["{{ gateway_codex_binary }}", app-server, daemon, restart]
+          when: not gateway_test_mode and (gateway_codex_config_change.changed | default(false)) and (gateway_codex_daemon_managed | default(false))
+
         - name: Inspect restored files
           ansible.builtin.stat:
             path: "{{ item }}"
@@ -497,7 +575,15 @@
         path: "{{ gateway_transaction.path }}"
         state: absent
       changed_when: false
-      when: not ansible_check_mode
+      when: not ansible_check_mode and not (gateway_cutover_pending | default(false))
+
+    - name: Report pending owner restart
+      ansible.builtin.debug:
+        msg:
+          - Gateway artifacts and configuration are activated and verified.
+          - Use the owning desktop's Restart action for the Grace connection.
+          - Then run bin/deploy-grace finalize.
+      when: not ansible_check_mode and (gateway_cutover_pending | default(false))
 
     - name: Clean disposable controller build
       ansible.builtin.file:

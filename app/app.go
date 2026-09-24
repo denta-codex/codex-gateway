@@ -35,6 +35,7 @@ func Run(ctx context.Context, args []string, extensions ...adapter.Adapter) erro
 	authPath := flags.String("auth-file", defaults.auth, "Grace Codex auth.json")
 	catalogPath := flags.String("catalog", defaults.catalog, "merged Codex model catalog")
 	codexBinary := flags.String("codex-binary", "codex", "installed Codex CLI")
+	discoveryBaseURL := flags.String("discovery-base-url", "", "existing loopback gateway base URL for model verification")
 	upstream := flags.String("upstream", "https://chatgpt.com/backend-api/codex", "fixed subscription upstream")
 	noAuthRefresh := flags.Bool("no-auth-refresh", false, "read credential without rotation (catalog preview only)")
 	commandArgs := args[1:]
@@ -67,7 +68,7 @@ func Run(ctx context.Context, args []string, extensions ...adapter.Adapter) erro
 		if len(flags.Args()) != 0 {
 			return errors.New("unexpected verify arguments")
 		}
-		return verify.ModelList(ctx, *codexBinary, *catalogPath, *upstream)
+		return verify.ModelList(ctx, *codexBinary, *catalogPath, *authPath, *discoveryBaseURL)
 	case "serve":
 		if len(flags.Args()) != 0 {
 			return errors.New("unexpected serve arguments")

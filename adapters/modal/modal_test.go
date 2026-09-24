@@ -99,6 +99,9 @@ func TestEndpointRequiresHTTPSOutsideLoopback(t *testing.T) {
 
 func TestModelsAreNamespacedAndUnique(t *testing.T) {
 	t.Parallel()
+	if len(modelSpecs) != 3 {
+		t.Fatalf("got %d Modal models, want the three approved endpoints", len(modelSpecs))
+	}
 	seen := map[string]bool{}
 	for _, model := range (Adapter{}).Models() {
 		if !strings.HasPrefix(model.Slug, Namespace+"/") || seen[model.Slug] || !json.Valid(model.Catalog) {
