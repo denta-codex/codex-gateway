@@ -13,7 +13,6 @@
     gateway_unit_path: "{{ (gateway_state_root + '/codex-gateway.service') if gateway_test_mode else '/etc/systemd/system/codex-gateway.service' }}"
     gateway_config_block: |
       openai_base_url = "http://127.0.0.1:48766/v1"
-      model_catalog_json = "{{ gateway_catalog_path }}"
       model_providers.chatgpt_gateway = { name = "ChatGPT Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses" }
   tasks:
     - name: Read target identity
@@ -108,7 +107,7 @@
 
     - name: Verify candidate with fresh Codex model/list
       ansible.builtin.command:
-        argv: ["{{ gateway_build_dir.path }}/codex-gateway", verify-model-list, --catalog, "{{ gateway_build_dir.path }}/model-catalog.json", --codex-binary, "{{ gateway_codex_binary }}"]
+        argv: ["{{ gateway_build_dir.path }}/codex-gateway", verify-model-list, --catalog, "{{ gateway_build_dir.path }}/model-catalog.json", --auth-file, "{{ gateway_home }}/.codex/auth.json", --codex-binary, "{{ gateway_codex_binary }}"]
       environment:
         CODEX_HOME: "{{ gateway_build_dir.path }}/codex-home"
       changed_when: false
@@ -333,9 +332,14 @@
             block: "{{ gateway_config_block }}"
           register: gateway_codex_config_change
 
-        - name: Verify activated catalog with fresh Codex model/list
+        - name: Restart Codex app server after configuration cutover
           ansible.builtin.command:
-            argv: ["{{ gateway_release_root }}/current/codex-gateway", verify-model-list, --catalog, "{{ gateway_catalog_path }}", --codex-binary, "{{ gateway_codex_binary }}"]
+            argv: ["{{ gateway_codex_binary }}", app-server, daemon, restart]
+          when: gateway_codex_config_change.changed and not gateway_test_mode
+
+        - name: Verify activated gateway discovery with fresh Codex model/list
+          ansible.builtin.command:
+            argv: ["{{ gateway_release_root }}/current/codex-gateway", verify-model-list, --catalog, "{{ gateway_catalog_path }}", --auth-file, "{{ gateway_home }}/.codex/auth.json", --discovery-base-url, "http://127.0.0.1:48766/v1", --codex-binary, "{{ gateway_codex_binary }}"]
           environment:
             CODEX_HOME: "{{ gateway_build_dir.path }}/codex-home"
           changed_when: false
@@ -427,6 +431,11 @@
             state: "{{ 'restarted' if gateway_previous_active.stdout == 'active' else 'stopped' }}"
           become: true
           when: not gateway_test_mode
+
+        - name: Restart Codex app server with restored configuration
+          ansible.builtin.command:
+            argv: ["{{ gateway_codex_binary }}", app-server, daemon, restart]
+          when: not gateway_test_mode and (gateway_codex_config_change.changed | default(false))
 
         - name: Inspect restored files
           ansible.builtin.stat:
