@@ -8,7 +8,8 @@ case "${1:-}" in
   prepare)
     shift
     exec ansible-playbook deploy/codex-gateway.yml --limit grace-agent \
-      --extra-vars gateway_cutover_phase=prepare "$@"
+      --extra-vars gateway_cutover_phase=prepare \
+      --extra-vars gateway_defer_app_server_restart=true "$@"
     ;;
   finalize)
     shift

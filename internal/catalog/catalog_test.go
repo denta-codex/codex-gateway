@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -93,10 +94,50 @@ func TestChatGPTUsesNativeSchemaWithoutNativeCapabilities(t *testing.T) {
 	if _, ok := row["availability_nux"]; ok {
 		t.Fatal("native promotion leaked")
 	}
-	if string(row["supports_search_tool"]) != "false" || string(row["priority"]) != "100" || !future.Keep {
+	if string(row["supports_search_tool"]) != "false" || !future.Keep {
 		t.Fatalf("merged row: %s", row)
 	}
 	if strings.Contains(string(row["base_instructions"]), "native instructions") || strings.Contains(string(row["model_messages"]), "native model") {
 		t.Fatal("native model instructions leaked")
+	}
+}
+
+func TestSubagentCatalogPolicy(t *testing.T) {
+	native := []byte(`{"models":[
+		{"slug":"gpt-6-astra","visibility":"list","priority":1},
+		{"slug":"gpt-6-sol","visibility":"list","priority":2},
+		{"slug":"gpt-6-luna","visibility":"list","priority":3},
+		{"slug":"gpt-5.6-sol","visibility":"list","priority":4}
+	]}`)
+	merged, err := Merge(native, []adapter.Adapter{modal.Adapter{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Models []struct {
+			Slug              string `json:"slug"`
+			Priority          int    `json:"priority"`
+			MultiAgentVersion string `json:"multi_agent_version"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(merged, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range catalog.Models {
+		if model.MultiAgentVersion != "v1" {
+			t.Fatalf("model %q collaboration version=%q", model.Slug, model.MultiAgentVersion)
+		}
+	}
+	sort.Slice(catalog.Models, func(i, j int) bool { return catalog.Models[i].Priority < catalog.Models[j].Priority })
+	if len(catalog.Models) < len(advertisedSubagentModels) {
+		t.Fatalf("models=%d", len(catalog.Models))
+	}
+	for index, slug := range advertisedSubagentModels {
+		if catalog.Models[index].Slug != slug || catalog.Models[index].Priority != index {
+			t.Fatalf("roster[%d]=%q priority=%d", index, catalog.Models[index].Slug, catalog.Models[index].Priority)
+		}
+	}
+	if catalog.Models[len(advertisedSubagentModels)].Slug != "gpt-6-astra" {
+		t.Fatalf("first non-roster model=%q", catalog.Models[len(advertisedSubagentModels)].Slug)
 	}
 }

@@ -22,6 +22,18 @@ type TokenSource interface {
 	Token(context.Context) (string, string, error)
 }
 
+// advertisedSubagentModels is intentionally a small, fixed policy rather than
+// another configuration system. Codex advertises the first five picker-visible
+// catalog rows as spawn overrides; this order does not prevent an explicit
+// spawn of any other catalog model.
+var advertisedSubagentModels = []string{
+	"gpt-6-sol",
+	"gpt-6-luna",
+	"modal/andrew-61005--ep-codex-tasks-shared-glm-server.us-west.modal.direct",
+	"modal/andrew-61005--ep-codex-tasks-shared-kimi-server.us-west.modal.direct",
+	"modal/andrew-61005--ep-codex-tasks-shared-deepseek-server.us-west.modal.direct",
+}
+
 func SubscriptionSource(auth TokenSource, client *http.Client, upstream, codexBinary string) Source {
 	return func(ctx context.Context) ([]byte, error) {
 		if codexBinary == "" {
@@ -135,7 +147,43 @@ func Merge(native []byte, adapters []adapter.Adapter) ([]byte, error) {
 			document.Models = append(document.Models, row)
 		}
 	}
+	if err := applySubagentCatalogOverrides(document.Models); err != nil {
+		return nil, err
+	}
 	return json.MarshalIndent(document, "", "  ")
+}
+
+func applySubagentCatalogOverrides(rows []json.RawMessage) error {
+	priority := make(map[string]int, len(advertisedSubagentModels))
+	for index, slug := range advertisedSubagentModels {
+		priority[slug] = index
+	}
+	for index, row := range rows {
+		var model map[string]json.RawMessage
+		if err := json.Unmarshal(row, &model); err != nil {
+			return errors.New("invalid catalog row while applying subagent policy")
+		}
+		var slug string
+		if err := json.Unmarshal(model["slug"], &slug); err != nil || slug == "" {
+			return errors.New("invalid catalog row while applying subagent policy")
+		}
+
+		// Temporary compatibility policy: Modal's Chat Completions bridge cannot
+		// consume the encrypted agent_message payload used by v2 handoffs.
+		model["multi_agent_version"] = json.RawMessage(`"v1"`)
+		modelPriority := 100 + index
+		if configured, ok := priority[slug]; ok {
+			modelPriority = configured
+		}
+		encodedPriority, _ := json.Marshal(modelPriority)
+		model["priority"] = encodedPriority
+		encoded, err := json.Marshal(model)
+		if err != nil {
+			return err
+		}
+		rows[index] = encoded
+	}
+	return nil
 }
 
 // Refresh replaces the catalog only after a complete successful merge.

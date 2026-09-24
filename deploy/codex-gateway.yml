@@ -4,6 +4,7 @@
   gather_facts: false
   vars:
     gateway_test_mode: "{{ gateway_disposable | default(false) | bool }}"
+    gateway_restart_deferred: "{{ gateway_defer_app_server_restart | default(false) | bool }}"
     gateway_repo: "{{ playbook_dir | dirname }}"
     gateway_release_root: "{{ gateway_home }}/.local/share/codex-gateway"
     gateway_release_dir: "{{ gateway_release_root }}/releases/{{ gateway_commit.stdout }}"
@@ -215,6 +216,14 @@
         block: "{{ gateway_config_block }}"
       when: ansible_check_mode
 
+    - name: Preview temporary v1 subagent mode
+      ansible.builtin.lineinfile:
+        path: "{{ gateway_codex_config }}"
+        regexp: '^multi_agent_v2\\s*='
+        insertafter: '^\\[features\\]$'
+        line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
+      when: ansible_check_mode
+
     - name: Read previous current release
       ansible.builtin.command:
         argv: [readlink, "{{ gateway_release_root }}/current"]
@@ -397,15 +406,27 @@
             block: "{{ gateway_config_block }}"
           register: gateway_codex_config_change
 
+        - name: Activate temporary v1 subagent mode
+          ansible.builtin.lineinfile:
+            path: "{{ gateway_codex_config }}"
+            regexp: '^multi_agent_v2\\s*='
+            insertafter: '^\\[features\\]$'
+            line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
+          register: gateway_subagent_mode_change
+
+        - name: Record whether Grace Codex configuration changed
+          ansible.builtin.set_fact:
+            gateway_codex_config_changed: "{{ gateway_codex_config_change.changed or gateway_subagent_mode_change.changed }}"
+
         - name: Record whether the cutover needs an owner restart
           ansible.builtin.set_fact:
-            gateway_cutover_pending: "{{ gateway_codex_config_change.changed and not gateway_test_mode and not (gateway_codex_daemon_managed | default(false)) }}"
+            gateway_cutover_pending: "{{ gateway_codex_config_changed and not gateway_test_mode and (gateway_restart_deferred or not (gateway_codex_daemon_managed | default(false))) }}"
 
         - name: Restart a daemon-managed Codex app server after configuration cutover
           ansible.builtin.command:
             argv: ["{{ gateway_codex_binary }}", app-server, daemon, restart]
           register: gateway_codex_managed_restart
-          when: gateway_codex_config_change.changed and not gateway_test_mode and (gateway_codex_daemon_managed | default(false))
+          when: gateway_codex_config_changed and not gateway_test_mode and (gateway_codex_daemon_managed | default(false)) and not gateway_restart_deferred
 
         - name: Verify activated gateway discovery with fresh Codex model/list
           ansible.builtin.command:
@@ -525,7 +546,7 @@
         - name: Restart daemon-managed Codex app server with restored configuration
           ansible.builtin.command:
             argv: ["{{ gateway_codex_binary }}", app-server, daemon, restart]
-          when: not gateway_test_mode and (gateway_codex_config_change.changed | default(false)) and (gateway_codex_daemon_managed | default(false))
+          when: not gateway_test_mode and (gateway_codex_config_changed | default(false)) and (gateway_codex_daemon_managed | default(false)) and not gateway_restart_deferred
 
         - name: Inspect restored files
           ansible.builtin.stat:
