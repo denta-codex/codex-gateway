@@ -22,7 +22,7 @@ func TestTranslateRequestConversationAndTools(t *testing.T) {
   "instructions":"be exact",
   "input":[
     {"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"},{"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"high"}]},
-    {"type":"reasoning","content":[{"type":"reasoning_text","text":"thinking"}]},
+    {"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}],"content":[]},
     {"type":"message","role":"assistant","content":[{"type":"output_text","text":"calling"}]},
     {"type":"function_call","name":"read","call_id":"call_1","arguments":"{\"path\":\"x\"}"},
     {"type":"function_call_output","call_id":"call_1","output":"ok"}

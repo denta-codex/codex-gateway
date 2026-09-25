@@ -34,7 +34,7 @@ func hasEvent(events []string, wanted string) bool {
 	return false
 }
 
-func TestBridgeChatStreamReasoningTextAndUsage(t *testing.T) {
+func TestBridgeChatStreamReasoningSummaryAndUsage(t *testing.T) {
 	t.Parallel()
 	recorder := httptest.NewRecorder()
 	translated := translatedRequest{Model: GLMFlashModel, Stream: true, Registry: newToolRegistry()}
@@ -47,10 +47,55 @@ func TestBridgeChatStreamReasoningTextAndUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := eventTypes(t, recorder.Body.String())
-	for _, wanted := range []string{"response.created", "response.reasoning_text.delta", "response.output_text.delta", "response.completed"} {
+	for _, wanted := range []string{
+		"response.created",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.done",
+		"response.reasoning_summary_part.done",
+		"response.output_text.delta",
+		"response.completed",
+	} {
 		if !hasEvent(events, wanted) {
 			t.Fatalf("missing %s in %v", wanted, events)
 		}
+	}
+	if hasEvent(events, "response.reasoning_text.delta") || hasEvent(events, "response.reasoning_text.done") {
+		t.Fatalf("raw reasoning events leaked into Responses output: %v", events)
+	}
+	var completed struct {
+		Type     string `json:"type"`
+		Response struct {
+			Output []struct {
+				Type    string            `json:"type"`
+				Summary []map[string]any  `json:"summary"`
+				Content []json.RawMessage `json:"content"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	for _, frame := range strings.Split(recorder.Body.String(), "\n\n") {
+		line := strings.TrimSpace(frame)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var candidate struct {
+			Type string `json:"type"`
+		}
+		payload := []byte(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		if json.Unmarshal(payload, &candidate) == nil && candidate.Type == "response.completed" {
+			if err := json.Unmarshal(payload, &completed); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if len(completed.Response.Output) < 1 {
+		t.Fatal("completed response did not include reasoning output")
+	}
+	reasoning := completed.Response.Output[0]
+	if reasoning.Type != "reasoning" || len(reasoning.Content) != 0 || len(reasoning.Summary) != 1 ||
+		reasoning.Summary[0]["type"] != "summary_text" || reasoning.Summary[0]["text"] != "think" {
+		t.Fatalf("reasoning was not stored as a summary: %#v", reasoning)
 	}
 	if strings.Index(recorder.Body.String(), `"type":"reasoning"`) > strings.LastIndex(recorder.Body.String(), `"type":"message"`) {
 		t.Fatal("final output was not kept in output_index order")

@@ -143,14 +143,20 @@ func (b *responseBridge) reasoningDelta(text string) error {
 	if b.reasoning == nil {
 		b.reasoning = &openReasoning{id: identifier("rs_"), index: b.nextIndex}
 		b.nextIndex++
-		item := map[string]any{"type": "reasoning", "id": b.reasoning.id, "summary": []any{}}
+		item := map[string]any{"type": "reasoning", "id": b.reasoning.id, "summary": []any{}, "content": []any{}}
 		if err := b.emit("response.output_item.added", map[string]any{"output_index": b.reasoning.index, "item": item}); err != nil {
+			return err
+		}
+		part := map[string]any{"type": "summary_text", "text": ""}
+		if err := b.emit("response.reasoning_summary_part.added", map[string]any{
+			"item_id": b.reasoning.id, "output_index": b.reasoning.index, "summary_index": 0, "part": part,
+		}); err != nil {
 			return err
 		}
 	}
 	b.reasoning.text.WriteString(text)
-	return b.emit("response.reasoning_text.delta", map[string]any{
-		"item_id": b.reasoning.id, "output_index": b.reasoning.index, "content_index": 0, "delta": text,
+	return b.emit("response.reasoning_summary_text.delta", map[string]any{
+		"item_id": b.reasoning.id, "output_index": b.reasoning.index, "summary_index": 0, "delta": text,
 	})
 }
 
@@ -210,12 +216,19 @@ func (b *responseBridge) closeReasoning() error {
 		return nil
 	}
 	text := b.reasoning.text.String()
-	if err := b.emit("response.reasoning_text.done", map[string]any{"item_id": b.reasoning.id, "output_index": b.reasoning.index, "content_index": 0, "text": text}); err != nil {
+	if err := b.emit("response.reasoning_summary_text.done", map[string]any{
+		"item_id": b.reasoning.id, "output_index": b.reasoning.index, "summary_index": 0, "text": text,
+	}); err != nil {
+		return err
+	}
+	part := map[string]any{"type": "summary_text", "text": text}
+	if err := b.emit("response.reasoning_summary_part.done", map[string]any{
+		"item_id": b.reasoning.id, "output_index": b.reasoning.index, "summary_index": 0, "part": part,
+	}); err != nil {
 		return err
 	}
 	item := map[string]any{
-		"type": "reasoning", "id": b.reasoning.id, "summary": []any{},
-		"content": []any{map[string]any{"type": "reasoning_text", "text": text}},
+		"type": "reasoning", "id": b.reasoning.id, "summary": []any{part}, "content": []any{},
 	}
 	if err := b.emit("response.output_item.done", map[string]any{"output_index": b.reasoning.index, "item": item}); err != nil {
 		return err
