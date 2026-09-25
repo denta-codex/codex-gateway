@@ -8,10 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/denta-codex/codex-gateway/adapter"
 )
 
 const maxSSEFrame = 8 << 20
@@ -47,8 +48,7 @@ type openToolCall struct {
 }
 
 type responseBridge struct {
-	w          http.ResponseWriter
-	stream     bool
+	sink       adapter.EventSink
 	model      string
 	registry   *toolRegistry
 	responseID string
@@ -66,9 +66,9 @@ type responseBridge struct {
 	callOrder  []int
 }
 
-func newResponseBridge(w http.ResponseWriter, translated translatedRequest) *responseBridge {
+func newResponseBridge(sink adapter.EventSink, translated translatedRequest) *responseBridge {
 	return &responseBridge{
-		w: w, stream: translated.Stream, model: Namespace + "/" + translated.Model,
+		sink: sink, model: Namespace + "/" + translated.Model,
 		registry: translated.Registry, responseID: identifier("resp_"), createdAt: time.Now().Unix(),
 		calls: map[int]*openToolCall{}, output: map[int]map[string]any{},
 	}
@@ -95,21 +95,14 @@ func (b *responseBridge) snapshot(status string) map[string]any {
 }
 
 func (b *responseBridge) start() error {
-	if b.started || !b.stream {
+	if b.started {
 		return nil
 	}
-	b.w.Header().Set("Content-Type", "text/event-stream")
-	b.w.Header().Set("Cache-Control", "no-cache")
-	b.w.Header().Set("X-Accel-Buffering", "no")
-	b.w.WriteHeader(http.StatusOK)
 	b.started = true
 	return b.emit("response.created", map[string]any{"response": b.snapshot("in_progress")})
 }
 
 func (b *responseBridge) emit(kind string, fields map[string]any) error {
-	if !b.stream {
-		return nil
-	}
 	if !b.started {
 		if err := b.start(); err != nil {
 			return err
@@ -122,13 +115,7 @@ func (b *responseBridge) emit(kind string, fields map[string]any) error {
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(b.w, "data: %s\n\n", data); err != nil {
-		return err
-	}
-	if flush, ok := b.w.(http.Flusher); ok {
-		flush.Flush()
-	}
-	return nil
+	return b.sink.Emit(data)
 }
 
 func (b *responseBridge) reasoningDelta(text string) error {
@@ -514,20 +501,14 @@ func (b *responseBridge) complete() error {
 			reason = "content_filter"
 		}
 		response["incomplete_details"] = map[string]any{"reason": reason}
-		if b.stream {
-			return b.emit("response.incomplete", map[string]any{"response": response})
-		}
-		return writeJSON(b.w, http.StatusOK, response)
+		return b.emit("response.incomplete", map[string]any{"response": response})
 	}
 	if b.finish != "" && b.finish != "stop" && b.finish != "tool_calls" && b.finish != "function_call" {
 		return fmt.Errorf("Modal Chat returned unsupported finish reason %q", b.finish)
 	}
 	b.terminal = true
 	response := b.snapshot("completed")
-	if b.stream {
-		return b.emit("response.completed", map[string]any{"response": response})
-	}
-	return writeJSON(b.w, http.StatusOK, response)
+	return b.emit("response.completed", map[string]any{"response": response})
 }
 
 func (b *responseBridge) fail(message string) {
@@ -542,18 +523,12 @@ func (b *responseBridge) fail(message string) {
 	response := b.snapshot("failed")
 	response["error"] = errorBody
 	response["last_error"] = errorBody
-	if b.stream {
-		_ = b.emit("response.failed", map[string]any{"response": response})
-		return
-	}
-	_ = writeJSON(b.w, http.StatusBadGateway, map[string]any{"error": errorBody})
+	_ = b.emit("response.failed", map[string]any{"response": response})
 }
 
 func bridgeChatStream(body io.Reader, bridge *responseBridge) error {
-	if bridge.stream {
-		if err := bridge.start(); err != nil {
-			return err
-		}
+	if err := bridge.start(); err != nil {
+		return err
 	}
 	reader := bufio.NewReaderSize(body, 64<<10)
 	var data strings.Builder
@@ -608,10 +583,4 @@ func bridgeChatStream(body io.Reader, bridge *responseBridge) error {
 			return errors.New("Modal Chat stream ended without finish_reason or [DONE]")
 		}
 	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) error {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	return json.NewEncoder(w).Encode(value)
 }

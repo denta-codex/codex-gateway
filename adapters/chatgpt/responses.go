@@ -1,14 +1,16 @@
 package chatgpt
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
+
+	"github.com/denta-codex/codex-gateway/adapter"
 )
 
 func identifier(prefix string) string {
@@ -73,7 +75,7 @@ func textItems(content string) []map[string]any {
 }
 
 type streamWriter struct {
-	w          http.ResponseWriter
+	sink       adapter.EventSink
 	responseID string
 	model      string
 	started    bool
@@ -88,23 +90,13 @@ func (s *streamWriter) emit(value map[string]any) error {
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(s.w, "data: %s\n\n", data); err != nil {
-		return err
-	}
-	if flush, ok := s.w.(http.Flusher); ok {
-		flush.Flush()
-	}
-	return nil
+	return s.sink.Emit(data)
 }
 
 func (s *streamWriter) start() error {
 	if s.started {
 		return nil
 	}
-	s.w.Header().Set("Content-Type", "text/event-stream")
-	s.w.Header().Set("Cache-Control", "no-cache")
-	s.w.Header().Set("X-Accel-Buffering", "no")
-	s.w.WriteHeader(http.StatusOK)
 	s.started = true
 	return s.emit(map[string]any{"type": "response.created", "response": s.response("in_progress", nil)})
 }
@@ -167,53 +159,41 @@ func (s *streamWriter) fail(message string) {
 	_ = s.emit(map[string]any{"type": "response.failed", "response": map[string]any{"id": s.responseID, "object": "response", "status": "failed", "model": s.model, "output": []any{}, "error": map[string]string{"code": "chatgpt_chat_failed", "message": message}}})
 }
 
-func (a Adapter) serveResponses(w http.ResponseWriter, r *http.Request, body []byte) {
+func (a Adapter) serveResponses(ctx context.Context, body []byte, sink adapter.EventSink) error {
 	p, err := prepare(body)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid_chatgpt_request", err.Error())
-		return
+		return adapter.NewError(400, "invalid_chatgpt_request", err.Error(), err)
 	}
-	writer := &streamWriter{w: w, responseID: identifier("resp_"), model: ModelSlug}
+	writer := &streamWriter{sink: sink, responseID: identifier("resp_"), model: ModelSlug}
 	var output strings.Builder
 	onText := func(delta string) error {
 		if output.Len()+len(delta) > maxPayload {
 			return errors.New("ChatGPT output exceeds 8 MiB")
 		}
 		output.WriteString(delta)
-		if p.stream && len(p.tools) == 0 {
+		if len(p.tools) == 0 {
 			return writer.textDelta(delta)
 		}
 		return nil
 	}
-	err = runWithRefresh(r.Context(), a.Auth, a.Run, p, onText)
+	err = runWithRefresh(ctx, a.Auth, a.Run, p, onText)
 	if err != nil {
 		status, message := publicTransportError(err)
 		if writer.started {
 			writer.fail(message)
 		} else {
-			respondError(w, status, "chatgpt_chat_failed", message)
+			return adapter.NewError(status, "chatgpt_chat_failed", message, err)
 		}
-		return
+		return nil
 	}
 	items, err := parseOutput(output.String(), p)
 	if err != nil {
 		if writer.started {
 			writer.fail("ChatGPT tool response was invalid")
 		} else {
-			respondError(w, 502, "chatgpt_tool_response_invalid", "ChatGPT tool response was invalid")
+			return adapter.NewError(502, "chatgpt_tool_response_invalid", "ChatGPT tool response was invalid", err)
 		}
-		return
+		return nil
 	}
-	if p.stream {
-		_ = writer.finish(items)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(writer.response("completed", items))
-}
-
-func respondError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"type": code, "message": message}})
+	return writer.finish(items)
 }

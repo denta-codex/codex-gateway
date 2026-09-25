@@ -3,8 +3,8 @@
 package example
 
 import (
+	"context"
 	"encoding/json"
-	"net/http"
 
 	"github.com/denta-codex/codex-gateway/adapter"
 )
@@ -15,7 +15,10 @@ func (Adapter) Namespace() string { return "example" }
 func (Adapter) Models() []adapter.Model {
 	return []adapter.Model{{Slug: "example/echo", Catalog: json.RawMessage(`{"slug":"example/echo","display_name":"Example Echo","description":"Adapter test model","visibility":"list","supported_in_api":true,"context_window":8192,"supported_reasoning_levels":[{"effort":"low","description":"Default"}],"default_reasoning_level":"low"}`)}}
 }
-func (Adapter) ServeResponses(w http.ResponseWriter, r *http.Request, body []byte) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": "example-response", "object": "response", "model": "example/echo", "output": []any{}})
+func (Adapter) ServeResponses(_ context.Context, _ adapter.Request, sink adapter.EventSink) error {
+	event, _ := json.Marshal(map[string]any{
+		"type":     "response.completed",
+		"response": map[string]any{"id": "example-response", "object": "response", "status": "completed", "model": "example/echo", "output": []any{}},
+	})
+	return sink.Emit(event)
 }

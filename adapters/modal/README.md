@@ -63,9 +63,11 @@ headers without exposing the original identifier.
 
 ## Limits
 
-The adapter requires self-contained input and rejects `previous_response_id`,
-remote compaction triggers, encrypted compaction state, input audio/video/files,
-and namespaced WebSockets. Local Codex compaction boundary markers are accepted.
+The adapter requires self-contained input. The gateway rejects
+`previous_response_id` with `previous_response_not_found`, allowing Codex to
+retry with full history over HTTP or WebSockets. The adapter rejects remote
+compaction triggers, encrypted compaction state, and input audio/video/files.
+Local Codex compaction boundary markers are accepted.
 Hosted OpenAI tools other than the gateway-backed `web_search` capability are
 omitted because Modal cannot execute them; local function, custom, namespace,
 and deferred tools remain available.

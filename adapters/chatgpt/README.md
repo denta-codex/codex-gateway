@@ -15,7 +15,7 @@ The helper reads Grace's existing ChatGPT access token and account ID from stdin
 
 The upstream conversation protocol is undocumented and can change. The transport and text stream decoder were adapted from the previously tested OpenCodex ChatGPT adapter. `proof.py` is copied from [suphotP/chatgpt-api](https://github.com/suphotP/chatgpt-api) at commit `f998a6d83f324cb3187396dd7efced0c40f29601`; its MIT license is preserved in `UPSTREAM-LICENSE`. The pinned helper dependencies are `curl_cffi==0.16.3` and `websocket-client==1.9.2`. Ansible checks them in a disposable cache during preview and stages an offline cache with the release during deployment.
 
-Current contract: text input, text output, HTTP Responses streaming, and local function or custom tool calls. Images, audio, files, hosted web search, namespaced Responses WebSockets, and namespaced Responses compaction are unavailable. The model advertises a conservative 32,000 token context window; longer Pro continuations have not been validated. Mode availability is checked against Grace's live ChatGPT catalog on each request.
+Current contract: text input, text output, canonical Responses events over the gateway's HTTP or WebSocket frontend, and local function or custom tool calls. Images, audio, files, hosted web search, and namespaced Responses compaction are unavailable. The model advertises a conservative 32,000 token context window; longer Pro continuations have not been validated. Mode availability is checked against Grace's live ChatGPT catalog on each request.
 
 Focused checks:
 

@@ -281,12 +281,8 @@ func (g *Gateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 501, "adapter_compaction_unsupported", "adapter does not support Responses compaction")
 				return
 			}
-			adapterRequest := r.Clone(r.Context())
-			adapterRequest.Header = r.Header.Clone()
-			adapterRequest.Header.Del("Content-Encoding")
-			adapterRequest.ContentLength = int64(len(decoded))
 			g.setModelsETag(w.Header())
-			extension.ServeResponses(w, adapterRequest, decoded)
+			g.serveAdapterHTTP(w, r, extension, decoded)
 			g.event("adapter_request", map[string]any{"request_id": id, "path": r.URL.Path, "adapter": extension.Namespace(), "model": model, "duration_ms": time.Since(started).Milliseconds()})
 			return
 		}
@@ -423,33 +419,6 @@ func websocketUpgrade(r *http.Request) bool {
 func (g *Gateway) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	id, started := requestID(), time.Now()
 	g.requests.Add(1)
-	token, account, err := g.config.Auth.Token(r.Context())
-	if err != nil {
-		writeError(w, 503, "subscription_auth_unavailable", "Grace needs codex login")
-		return
-	}
-	target, err := url.Parse(g.target(r.URL.Path, r.URL.RawQuery))
-	if err != nil {
-		writeError(w, 502, "upstream_request_failed", "invalid subscription URL")
-		return
-	}
-	target.Scheme = "wss"
-	headers := http.Header{}
-	copyRequestHeaders(headers, r.Header)
-	headers.Set("Authorization", "Bearer "+token)
-	headers.Set("Chatgpt-Account-Id", account)
-	upstream, response, err := websocket.Dial(r.Context(), target.String(), &websocket.DialOptions{HTTPHeader: headers, HTTPClient: g.config.Client})
-	if err != nil {
-		status := 0
-		if response != nil {
-			status = response.StatusCode
-		}
-		writeError(w, 502, "upstream_unavailable", "subscription WebSocket unavailable")
-		g.event("websocket_error", map[string]any{"request_id": id, "upstream_status": status})
-		return
-	}
-	defer upstream.CloseNow()
-	upstream.SetReadLimit(MaxRequestBytes)
 	client, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
 		return
@@ -458,63 +427,15 @@ func (g *Gateway) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	client.SetReadLimit(MaxRequestBytes)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	results := make(chan error, 2)
-	go func() { results <- pump(ctx, client, upstream, true, nil, nil) }()
-	go func() {
-		results <- pump(ctx, upstream, client, false, g.rewriteModelsETagMetadata, func(data []byte) {
-			var message struct {
-				Type     string `json:"type"`
-				StreamID string `json:"stream_id"`
-			}
-			if json.Unmarshal(data, &message) != nil {
-				return
-			}
-			observer := newUsageObserver()
-			observer.parseLine(data)
-			if !observer.complete {
-				return
-			}
-			g.event("request_complete", map[string]any{"request_id": id, "path": r.URL.Path, "provider": "subscription", "transport": "websocket", "status": 200, "stream_id": message.StreamID, "response_event": observer.event, "actual_service_tier": observer.serviceTier, "input_tokens": observer.input, "output_tokens": observer.output, "total_tokens": observer.total, "duration_ms": time.Since(started).Milliseconds()})
-		})
-	}()
-	err = <-results
-	cancel()
+	session := newWebSocketSession(g, r, client, id, started, ctx, cancel)
+	err = session.run()
 	_ = client.Close(websocket.StatusNormalClosure, "")
-	_ = upstream.Close(websocket.StatusNormalClosure, "")
+	session.closeNative()
 	fields := map[string]any{"request_id": id, "path": r.URL.Path, "duration_ms": time.Since(started).Milliseconds()}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		fields["close_error_type"] = fmt.Sprintf("%T", err)
 	}
 	g.event("websocket_closed", fields)
-}
-
-func pump(ctx context.Context, from, to *websocket.Conn, inspect bool, transform func([]byte) []byte, onEvent func([]byte)) error {
-	for {
-		typeID, data, err := from.Read(ctx)
-		if err != nil {
-			return err
-		}
-		if inspect && typeID == websocket.MessageText {
-			var message struct {
-				Type  string `json:"type"`
-				Model string `json:"model"`
-			}
-			if json.Unmarshal(data, &message) == nil && message.Type == "response.create" && strings.Contains(message.Model, "/") {
-				// Adapter WebSocket transport must be implemented by that adapter; never
-				// leak a namespaced model request to the subscription upstream.
-				return errors.New("adapter WebSocket transport unavailable")
-			}
-		}
-		if transform != nil && typeID == websocket.MessageText {
-			data = transform(data)
-		}
-		if err := to.Write(ctx, typeID, data); err != nil {
-			return err
-		}
-		if onEvent != nil && typeID == websocket.MessageText {
-			onEvent(data)
-		}
-	}
 }
 
 func (g *Gateway) rewriteModelsETagMetadata(data []byte) []byte {

@@ -3,10 +3,18 @@ package modal
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type recorderEventSink struct{ recorder *httptest.ResponseRecorder }
+
+func (s recorderEventSink) Emit(event json.RawMessage) error {
+	_, err := fmt.Fprintf(s.recorder, "data: %s\n\n", event)
+	return err
+}
 
 func eventTypes(t *testing.T, body string) []string {
 	t.Helper()
@@ -38,7 +46,7 @@ func TestBridgeChatStreamReasoningSummaryAndUsage(t *testing.T) {
 	t.Parallel()
 	recorder := httptest.NewRecorder()
 	translated := translatedRequest{Model: GLMFlashModel, Stream: true, Registry: newToolRegistry()}
-	bridge := newResponseBridge(recorder, translated)
+	bridge := newResponseBridge(recorderEventSink{recorder}, translated)
 	sse := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n" +
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n" +
@@ -108,7 +116,7 @@ func TestBridgeChatStreamParallelFunctionAndCustomCalls(t *testing.T) {
 	_ = registry.add(toolIdentity{Name: "read", WireName: "read", Kind: functionTool})
 	_ = registry.add(toolIdentity{Name: "shell", WireName: "shell", Kind: customTool})
 	recorder := httptest.NewRecorder()
-	bridge := newResponseBridge(recorder, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: registry})
+	bridge := newResponseBridge(recorderEventSink{recorder}, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: registry})
 	sse := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read","arguments":"{\"pa"}},{"index":1,"id":"call_b","function":{"name":"shell","arguments":"{\"in"}}]}}]}` + "\n\n" +
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"x\"}"}},{"index":1,"function":{"arguments":"put\":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
@@ -127,7 +135,7 @@ func TestBridgeChatStreamParallelFunctionAndCustomCalls(t *testing.T) {
 func TestBridgeChatStreamRejectsTruncation(t *testing.T) {
 	t.Parallel()
 	recorder := httptest.NewRecorder()
-	bridge := newResponseBridge(recorder, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: newToolRegistry()})
+	bridge := newResponseBridge(recorderEventSink{recorder}, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: newToolRegistry()})
 	err := bridgeChatStream(bytes.NewBufferString(`data: {"choices":[{"delta":{"content":"partial"}}]}`+"\n\n"), bridge)
 	if err == nil || !strings.Contains(err.Error(), "ended without") {
 		t.Fatalf("unexpected error: %v", err)
@@ -148,7 +156,8 @@ func TestBridgeRejectsUndeclaredAndMalformedToolCalls(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			registry := newToolRegistry()
 			_ = registry.add(toolIdentity{Name: "read", WireName: "read", Kind: functionTool})
-			bridge := newResponseBridge(httptest.NewRecorder(), translatedRequest{Model: GLMFlashModel, Stream: true, Registry: registry})
+			recorder := httptest.NewRecorder()
+			bridge := newResponseBridge(recorderEventSink{recorder}, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: registry})
 			if err := bridgeChatStream(bytes.NewBufferString(sse), bridge); err == nil {
 				t.Fatal("accepted invalid tool stream")
 			}
@@ -159,7 +168,7 @@ func TestBridgeRejectsUndeclaredAndMalformedToolCalls(t *testing.T) {
 func TestBridgeDoesNotEchoUpstreamErrorPayload(t *testing.T) {
 	t.Parallel()
 	recorder := httptest.NewRecorder()
-	bridge := newResponseBridge(recorder, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: newToolRegistry()})
+	bridge := newResponseBridge(recorderEventSink{recorder}, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: newToolRegistry()})
 	err := bridgeChatStream(bytes.NewBufferString(`data: {"error":{"message":"sensitive-upstream-detail"}}`+"\n\n"), bridge)
 	if err == nil {
 		t.Fatal("accepted upstream error event")
@@ -176,7 +185,8 @@ func TestBridgeRejectsToolOutsideChoice(t *testing.T) {
 	_ = registry.add(toolIdentity{Name: "read", WireName: "read", Kind: functionTool})
 	_ = registry.add(toolIdentity{Name: "write", WireName: "write", Kind: functionTool})
 	registry.permitOnly("read")
-	bridge := newResponseBridge(httptest.NewRecorder(), translatedRequest{Model: GLMFlashModel, Stream: true, Registry: registry})
+	recorder := httptest.NewRecorder()
+	bridge := newResponseBridge(recorderEventSink{recorder}, translatedRequest{Model: GLMFlashModel, Stream: true, Registry: registry})
 	sse := `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n\n"
 	if err := bridgeChatStream(bytes.NewBufferString(sse), bridge); err == nil || !strings.Contains(err.Error(), "outside tool_choice") {
 		t.Fatalf("unexpected error: %v", err)

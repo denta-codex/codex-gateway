@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/coder/websocket"
@@ -20,6 +21,23 @@ import (
 	"github.com/denta-codex/codex-gateway/internal/subscription"
 	"github.com/klauspost/compress/zstd"
 )
+
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(data)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
 
 func testAuth(t *testing.T) *subscription.Auth {
 	t.Helper()
@@ -129,7 +147,7 @@ func TestSubscriptionPassthroughAndFallback(t *testing.T) {
 		_, _ = io.WriteString(w, "opaque fallback")
 	}))
 	defer upstream.Close()
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	g, err := New(Config{UpstreamBase: upstream.URL + "/backend-api/codex", CatalogPath: testCatalog(t), Auth: testAuth(t), Client: upstream.Client(), Logger: log.New(&logs, "", 0)})
 	if err != nil {
 		t.Fatal(err)
@@ -306,6 +324,89 @@ func TestNativeWebSocketPassthrough(t *testing.T) {
 	}
 	if !bytes.Equal(echo, message) {
 		t.Fatalf("WebSocket changed message: %q", echo)
+	}
+}
+
+func TestWebSocketMixesStatelessAdapterAndNativeRequests(t *testing.T) {
+	var upstreamConnections atomic.Int64
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamConnections.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			messageType, data, err := conn.Read(context.Background())
+			if err != nil {
+				return
+			}
+			if err := conn.Write(context.Background(), messageType, data); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	g, err := New(Config{UpstreamBase: upstream.URL, CatalogPath: testCatalog(t), Auth: testAuth(t), Client: upstream.Client(), Logger: log.New(io.Discard, "", 0)}, example.Adapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(g)
+	defer server.Close()
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"response.create","model":"example/echo","stream_id":"adapter-1","input":"hello"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := conn.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var adapterEvent struct {
+		Type     string `json:"type"`
+		StreamID string `json:"stream_id"`
+	}
+	if json.Unmarshal(data, &adapterEvent) != nil || adapterEvent.Type != "response.completed" || adapterEvent.StreamID != "adapter-1" {
+		t.Fatalf("adapter event=%s", data)
+	}
+	if upstreamConnections.Load() != 0 {
+		t.Fatal("adapter request eagerly opened the native WebSocket")
+	}
+
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"response.create","model":"example/echo","stream_id":"adapter-2","previous_response_id":"example-response","input":"again"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = conn.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing struct {
+		Type     string `json:"type"`
+		StreamID string `json:"stream_id"`
+		Error    struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(data, &missing) != nil || missing.Type != "error" || missing.StreamID != "adapter-2" || missing.Error.Code != "previous_response_not_found" {
+		t.Fatalf("continuation error=%s", data)
+	}
+
+	native := []byte(`{"type":"response.create","model":"gpt-6-sol","stream_id":"native-1","future_field":true}`)
+	if err := conn.Write(context.Background(), websocket.MessageText, native); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = conn.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, native) || upstreamConnections.Load() != 1 {
+		t.Fatalf("native message=%s connections=%d", data, upstreamConnections.Load())
 	}
 }
 

@@ -39,39 +39,49 @@ func (Adapter) Models() []adapter.Model { return models() }
 
 func (a *Adapter) SetSubscriptionAuth(auth adapter.TokenSource) { a.Auth = auth }
 
-func (a Adapter) ServeResponses(w http.ResponseWriter, r *http.Request, body []byte) {
-	searchEnabled, _ := websearch.Enabled(body)
+func (a Adapter) ServeResponses(ctx context.Context, request adapter.Request, sink adapter.EventSink) error {
+	searchEnabled, _ := websearch.Enabled(request.Body)
 	if searchEnabled {
 		service, err := websearch.New(websearch.Config{Auth: a.Auth, Client: a.SearchClient})
 		if err != nil {
-			respondAdapterError(w, http.StatusServiceUnavailable, "web_search_unavailable", "ChatGPT web search is unavailable")
-			return
+			return adapter.NewError(http.StatusServiceUnavailable, "web_search_unavailable", "ChatGPT web search is unavailable", err)
 		}
-		service.ServeResponses(w, r, body, websearch.BackendFunc(func(ctx context.Context, iteration []byte) (*http.Response, error) {
+		capture := newResponseCapture()
+		httpRequest := httpRequestFrom(ctx, request)
+		service.ServeResponses(capture, httpRequest, request.Body, websearch.BackendFunc(func(iterationCtx context.Context, iteration []byte) (*http.Response, error) {
 			capture := newResponseCapture()
-			a.serveResponses(capture, r.Clone(ctx), iteration)
+			iterationRequest := request
+			iterationRequest.Body = iteration
+			err := a.serveResponses(iterationCtx, iterationRequest, eventHTTPSink{capture})
+			if err != nil {
+				writeCapturedError(capture, err)
+			}
 			return capture.response()
 		}))
-		return
+		response, err := capture.response()
+		if err != nil {
+			return adapter.NewError(http.StatusBadGateway, "web_search_invalid_response", "web search returned an invalid response", err)
+		}
+		return capturedResponseEvents(response, sink)
 	}
-	a.serveResponses(w, r, body)
+	return a.serveResponses(ctx, request, sink)
 }
 
-func (a Adapter) serveResponses(w http.ResponseWriter, r *http.Request, body []byte) {
-	translated, err := translateRequest(body)
+func (a Adapter) serveResponses(ctx context.Context, request adapter.Request, sink adapter.EventSink) error {
+	translated, err := translateRequest(request.Body)
 	if err != nil {
-		respondAdapterError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
+		if errors.Is(err, errEncryptedContextCompaction) || errors.Is(err, errResponsesCompaction) {
+			return adapter.NewError(http.StatusUnprocessableEntity, "adapter_compaction_unsupported", err.Error(), err)
+		}
+		return adapter.NewError(http.StatusBadRequest, "invalid_request", err.Error(), err)
 	}
 	token, err := a.token()
 	if err != nil {
-		respondAdapterError(w, http.StatusServiceUnavailable, "modal_credential_unavailable", err.Error())
-		return
+		return adapter.NewError(http.StatusServiceUnavailable, "modal_credential_unavailable", err.Error(), err)
 	}
 	endpoint, err := a.endpoint()
 	if err != nil {
-		respondAdapterError(w, http.StatusInternalServerError, "modal_configuration_error", err.Error())
-		return
+		return adapter.NewError(http.StatusInternalServerError, "modal_configuration_error", err.Error(), err)
 	}
 
 	client := a.Client
@@ -87,19 +97,18 @@ func (a Adapter) serveResponses(w http.ResponseWriter, r *http.Request, body []b
 
 	var response *http.Response
 	var lastStatus int
-	sessionID := modalSessionID(r, translated.Model)
+	sessionID := modalSessionID(request, translated.Model)
 	for attempt := 0; attempt < 2; attempt++ {
-		request, requestErr := http.NewRequestWithContext(r.Context(), http.MethodPost, endpoint, bytes.NewReader(translated.Body))
+		upstreamRequest, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(translated.Body))
 		if requestErr != nil {
-			respondAdapterError(w, http.StatusInternalServerError, "modal_configuration_error", "could not build Modal request")
-			return
+			return adapter.NewError(http.StatusInternalServerError, "modal_configuration_error", "could not build Modal request", requestErr)
 		}
-		request.Header.Set("Authorization", "Bearer "+token)
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Accept", "text/event-stream")
-		request.Header.Set("Modal-Session-Id", sessionID)
+		upstreamRequest.Header.Set("Authorization", "Bearer "+token)
+		upstreamRequest.Header.Set("Content-Type", "application/json")
+		upstreamRequest.Header.Set("Accept", "text/event-stream")
+		upstreamRequest.Header.Set("Modal-Session-Id", sessionID)
 
-		response, err = client.Do(request)
+		response, err = client.Do(upstreamRequest)
 		if err == nil && !retryableStatus(response.StatusCode) {
 			break
 		}
@@ -110,7 +119,7 @@ func (a Adapter) serveResponses(w http.ResponseWriter, r *http.Request, body []b
 			response = nil
 		}
 		if attempt == 0 {
-			if waitErr := waitForRetry(r.Context(), 250*time.Millisecond); waitErr != nil {
+			if waitErr := waitForRetry(ctx, 250*time.Millisecond); waitErr != nil {
 				err = waitErr
 				break
 			}
@@ -118,30 +127,27 @@ func (a Adapter) serveResponses(w http.ResponseWriter, r *http.Request, body []b
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			respondAdapterError(w, http.StatusGatewayTimeout, "modal_transport_error", "Modal request was canceled or timed out")
-			return
+			return adapter.NewError(http.StatusGatewayTimeout, "modal_transport_error", "Modal request was canceled or timed out", err)
 		}
-		respondAdapterError(w, http.StatusBadGateway, "modal_transport_error", "Modal could not be reached")
-		return
+		return adapter.NewError(http.StatusBadGateway, "modal_transport_error", "Modal could not be reached", err)
 	}
 	if response == nil {
 		if lastStatus != 0 {
-			respondAdapterError(w, http.StatusBadGateway, "modal_upstream_error", fmt.Sprintf("Modal returned HTTP %d", lastStatus))
-			return
+			return adapter.NewError(http.StatusBadGateway, "modal_upstream_error", fmt.Sprintf("Modal returned HTTP %d", lastStatus), nil)
 		}
-		respondAdapterError(w, http.StatusBadGateway, "modal_transport_error", "Modal did not return a response")
-		return
+		return adapter.NewError(http.StatusBadGateway, "modal_transport_error", "Modal did not return a response", nil)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		respondAdapterError(w, http.StatusBadGateway, "modal_upstream_error", fmt.Sprintf("Modal returned HTTP %d", response.StatusCode))
-		return
+		return adapter.NewError(http.StatusBadGateway, "modal_upstream_error", fmt.Sprintf("Modal returned HTTP %d", response.StatusCode), nil)
 	}
 
-	bridge := newResponseBridge(w, translated)
+	bridge := newResponseBridge(sink, translated)
 	if err := bridgeChatStream(response.Body, bridge); err != nil {
 		bridge.fail(err.Error())
+		return nil
 	}
+	return nil
 }
 
 func (a Adapter) endpoint() (string, error) {
@@ -177,11 +183,11 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func modalSessionID(r *http.Request, model string) string {
+func modalSessionID(request adapter.Request, model string) string {
 	seed := model
 	found := false
 	for _, key := range []string{"thread-id", "x-codex-parent-thread-id", "conversation-id", "session-id"} {
-		if value := strings.TrimSpace(r.Header.Get(key)); value != "" {
+		if value := strings.TrimSpace(request.MetadataValue(key)); value != "" {
 			seed += "\x00" + key + "=" + value
 			found = true
 		}
@@ -191,10 +197,4 @@ func modalSessionID(r *http.Request, model string) string {
 	}
 	digest := sha256.Sum256([]byte(seed))
 	return "codex-" + hex.EncodeToString(digest[:16])
-}
-
-func respondAdapterError(w http.ResponseWriter, status int, code, message string) {
-	_ = writeJSON(w, status, map[string]any{"error": map[string]any{
-		"code": code, "message": message, "type": "adapter_error",
-	}})
 }

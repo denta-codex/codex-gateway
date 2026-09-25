@@ -17,7 +17,7 @@
       model_providers.chatgpt_gateway = { name = "ChatGPT Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses" }
       model_providers.modal_gateway = { name = "Modal Gateway", base_url = "http://127.0.0.1:48766/v1", requires_openai_auth = true, supports_websockets = false, wire_api = "responses", request_max_retries = 0, stream_max_retries = 0 }
       # END CODEX GATEWAY MANAGED
-    gateway_subagent_mode_line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
+    gateway_retired_subagent_mode_line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
   tasks:
     - name: Read target identity
       ansible.builtin.command:
@@ -123,7 +123,7 @@
       ansible.builtin.assert:
         that:
           - gateway_managed_config_block in (gateway_codex_config_raw.content | b64decode)
-          - gateway_subagent_mode_line in (gateway_codex_config_raw.content | b64decode).splitlines()
+          - gateway_retired_subagent_mode_line not in (gateway_codex_config_raw.content | b64decode).splitlines()
         fail_msg: Managed Codex settings changed before finalization; retain the pending transaction and roll back.
 
     - name: Inspect replacement Codex app server

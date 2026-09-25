@@ -3,11 +3,41 @@ package chatgpt
 import (
 	"context"
 	"encoding/json"
-	"net/http"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	gatewayadapter "github.com/denta-codex/codex-gateway/adapter"
 )
+
+func serveAdapterForTest(t *testing.T, implementation Adapter, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	var request struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &request)
+	err := implementation.ServeResponses(context.Background(), gatewayadapter.Request{Body: body}, gatewayadapter.EventSinkFunc(func(event json.RawMessage) error {
+		if request.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, err := fmt.Fprintf(w, "data: %s\n\n", event)
+			return err
+		}
+		var terminal struct {
+			Type     string          `json:"type"`
+			Response json.RawMessage `json:"response"`
+		}
+		if json.Unmarshal(event, &terminal) == nil && terminal.Type == "response.completed" {
+			_, _ = w.Write(terminal.Response)
+		}
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
 
 type fakeAuth struct {
 	token     string
@@ -62,8 +92,7 @@ func TestStreamingTextAndToolResults(t *testing.T) {
 		return onText(" world")
 	}}
 	body := `{"model":"` + ModelSlug + `","input":"Say hello","stream":true}`
-	w := httptest.NewRecorder()
-	textAdapter.ServeResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", nil), []byte(body))
+	w := serveAdapterForTest(t, textAdapter, []byte(body))
 	response := w.Result()
 	if response.StatusCode != 200 || response.Header.Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("stream response: %d %v", response.StatusCode, response.Header)
@@ -85,8 +114,7 @@ func TestStreamingTextAndToolResults(t *testing.T) {
 		return onText(`{"text":"","tool_calls":[{"name":"functions.exec","arguments":{"input":"pwd"}}]}`)
 	}}
 	body = `{"model":"` + ModelSlug + `","input":[{"type":"custom_tool_call_output","call_id":"call_previous","output":"tool_result"}],"tools":[{"type":"custom","name":"functions.exec","description":"Execute","format":{"type":"text"}}],"tool_choice":"required","reasoning":{"effort":"high"}}`
-	w = httptest.NewRecorder()
-	toolAdapter.ServeResponses(w, httptest.NewRequest(http.MethodPost, "/v1/responses", nil), []byte(body))
+	w = serveAdapterForTest(t, toolAdapter, []byte(body))
 	var result struct {
 		Output []struct {
 			Type   string `json:"type"`

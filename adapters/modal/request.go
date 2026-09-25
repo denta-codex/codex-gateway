@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+var (
+	errEncryptedContextCompaction = errors.New("encrypted context compaction is unsupported by the Modal adapter")
+	errResponsesCompaction        = errors.New("Responses compaction is unsupported by the Modal adapter")
+)
+
 const maxTranslatedPayload = 16 << 20
 
 var invalidToolName = regexp.MustCompile(`[^A-Za-z0-9_-]`)
@@ -593,9 +598,9 @@ func translateMessages(instructions *string, rawInput json.RawMessage, registry 
 			if _, encrypted := item["encrypted_content"].(string); !encrypted {
 				continue
 			}
-			return nil, errors.New("encrypted context compaction is unsupported by the Modal adapter")
+			return nil, errEncryptedContextCompaction
 		case "compaction", "compaction_trigger":
-			return nil, fmt.Errorf("Responses item %q is unsupported by the Modal adapter", kind)
+			return nil, fmt.Errorf("%w: item %q", errResponsesCompaction, kind)
 		default:
 			return nil, fmt.Errorf("Responses item %q is unsupported by the Modal adapter", kind)
 		}

@@ -3,9 +3,9 @@
 package chatgpt
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"strings"
 
 	"github.com/denta-codex/codex-gateway/adapter"
@@ -43,7 +43,7 @@ func (Adapter) Models() []adapter.Model {
   "supports_reasoning_summary_parameter":false, "supports_reasoning_effort_updates":false,
   "supports_image_detail_original":false, "support_verbosity":false,
   "use_responses_lite":false, "web_search_tool_type":null,
-  "prefer_websockets":false, "tool_mode":"code_mode_only",
+  "prefer_websockets":true, "tool_mode":"code_mode_only",
   "shell_type":"shell_command", "apply_patch_tool_type":"freeform",
   "model_messages":{}, "base_instructions":"You are Codex, a coding agent. Follow the user's request and use tools when needed.",
   "experimental_supported_tools":[], "service_tiers":[], "additional_speed_tiers":[],
@@ -237,6 +237,6 @@ func parseToolChoice(raw json.RawMessage) (choice, name string, required bool, e
 	return selected.Type, selected.Name, true, nil
 }
 
-func (a Adapter) ServeResponses(w http.ResponseWriter, r *http.Request, body []byte) {
-	a.serveResponses(w, r, body)
+func (a Adapter) ServeResponses(ctx context.Context, request adapter.Request, sink adapter.EventSink) error {
+	return a.serveResponses(ctx, request.Body, sink)
 }

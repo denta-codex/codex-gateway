@@ -59,7 +59,7 @@ func models() []adapter.Model {
 			"support_verbosity":                    false,
 			"use_responses_lite":                   false,
 			"web_search_tool_type":                 "text_and_image",
-			"prefer_websockets":                    false,
+			"prefer_websockets":                    true,
 			"tool_mode":                            "code_mode_only",
 			"shell_type":                           "shell_command",
 			"apply_patch_tool_type":                "freeform",

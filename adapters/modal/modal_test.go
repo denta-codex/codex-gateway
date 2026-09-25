@@ -3,13 +3,60 @@ package modal
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+
+	gatewayadapter "github.com/denta-codex/codex-gateway/adapter"
 )
+
+func serveAdapterForTest(w *httptest.ResponseRecorder, r *http.Request, implementation Adapter, body []byte) {
+	stream := requestStreamForTest(body)
+	sink := gatewayadapter.EventSinkFunc(func(event json.RawMessage) error {
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, err := fmt.Fprintf(w, "data: %s\n\n", event)
+			return err
+		}
+		var terminal struct {
+			Type     string          `json:"type"`
+			Response json.RawMessage `json:"response"`
+		}
+		if json.Unmarshal(event, &terminal) == nil && strings.HasPrefix(terminal.Type, "response.") && len(terminal.Response) > 0 && (terminal.Type == "response.completed" || terminal.Type == "response.incomplete" || terminal.Type == "response.failed") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(terminal.Response)
+		}
+		return nil
+	})
+	metadata := map[string][]string{}
+	for key, values := range r.Header {
+		metadata[key] = append([]string(nil), values...)
+	}
+	err := implementation.ServeResponses(r.Context(), gatewayadapter.Request{Body: body, Metadata: metadata}, sink)
+	if err == nil {
+		return
+	}
+	status := http.StatusBadGateway
+	var public *gatewayadapter.Error
+	if errors.As(err, &public) {
+		status = public.Status
+	}
+	w.WriteHeader(status)
+	_, _ = w.WriteString(err.Error())
+}
+
+func requestStreamForTest(body []byte) bool {
+	var request struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &request)
+	return request.Stream
+}
 
 type testSubscriptionAuth struct{}
 
@@ -60,7 +107,7 @@ func TestAdapterEndToEndAndRetry(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	request.Header.Set("session-id", "thread-1")
 	body := []byte(`{"model":"modal/` + GLMFlashModel + `","input":"hello","stream":false}`)
-	adapter.ServeResponses(recorder, request, body)
+	serveAdapterForTest(recorder, request, adapter, body)
 	if attempts != 2 {
 		t.Fatalf("got %d attempts, want 2", attempts)
 	}
@@ -87,7 +134,7 @@ func TestAdapterDoesNotForwardCallerCredentials(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer caller-secret")
 	request.Header.Set("Cookie", "private=true")
 	request.Header.Set("X-Secret", "private")
-	Adapter{BaseURL: "https://modal.invalid/v1", Token: "modal-token", Client: client}.ServeResponses(recorder, request,
+	serveAdapterForTest(recorder, request, Adapter{BaseURL: "https://modal.invalid/v1", Token: "modal-token", Client: client},
 		[]byte(`{"model":"modal/`+GLMFlashModel+`","input":"hello","stream":true}`))
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "response.completed") {
 		t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
@@ -104,6 +151,25 @@ func TestEndpointRequiresHTTPSOutsideLoopback(t *testing.T) {
 	}
 }
 
+func TestAdapterReportsOpaqueCompactionExplicitly(t *testing.T) {
+	for name, input := range map[string]string{
+		"encrypted context": `[{"type":"context_compaction","encrypted_content":"opaque"}]`,
+		"remote trigger":    `[{"type":"compaction_trigger"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := []byte(`{"model":"modal/` + GLMFlashModel + `","input":` + input + `}`)
+			err := (Adapter{}).ServeResponses(context.Background(), gatewayadapter.Request{Body: body}, gatewayadapter.EventSinkFunc(func(json.RawMessage) error {
+				t.Fatal("compaction request emitted an event")
+				return nil
+			}))
+			var public *gatewayadapter.Error
+			if !errors.As(err, &public) || public.Code != "adapter_compaction_unsupported" || public.Status != http.StatusUnprocessableEntity {
+				t.Fatalf("error=%#v", err)
+			}
+		})
+	}
+}
+
 func TestModelsAreNamespacedAndUnique(t *testing.T) {
 	t.Parallel()
 	if len(modelSpecs) != 3 {
@@ -116,7 +182,7 @@ func TestModelsAreNamespacedAndUnique(t *testing.T) {
 		}
 		seen[model.Slug] = true
 		var catalog map[string]any
-		if err := json.Unmarshal(model.Catalog, &catalog); err != nil || catalog["supports_search_tool"] != true || catalog["web_search_tool_type"] != "text_and_image" {
+		if err := json.Unmarshal(model.Catalog, &catalog); err != nil || catalog["supports_search_tool"] != true || catalog["web_search_tool_type"] != "text_and_image" || catalog["prefer_websockets"] != true {
 			t.Fatalf("model does not advertise hosted search: %v %#v", err, catalog)
 		}
 	}
@@ -171,7 +237,7 @@ func TestAdapterRunsHostedSearchThroughSubscription(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	body := []byte(`{"model":"modal/` + GLMFlashModel + `","input":"What changed?","stream":false,"tools":[{"type":"web_search","search_context_size":"high"}]}`)
-	modalAdapter.ServeResponses(recorder, request, body)
+	serveAdapterForTest(recorder, request, *modalAdapter, body)
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Final answer from GLM") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}

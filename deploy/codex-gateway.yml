@@ -216,12 +216,11 @@
         block: "{{ gateway_config_block }}"
       when: ansible_check_mode
 
-    - name: Preview temporary v1 subagent mode
+    - name: Preview retirement of the temporary v1 subagent override
       ansible.builtin.lineinfile:
         path: "{{ gateway_codex_config }}"
-        regexp: '^multi_agent_v2\s*='
-        insertafter: '^\[features\]$'
-        line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
+        regexp: '^multi_agent_v2\s*=\s*\{\s*enabled\s*=\s*false\s*\}\s*# Temporary: Modal cannot consume encrypted v2 agent handoffs\.$'
+        state: absent
       when: ansible_check_mode
 
     - name: Read previous current release
@@ -406,12 +405,11 @@
             block: "{{ gateway_config_block }}"
           register: gateway_codex_config_change
 
-        - name: Activate temporary v1 subagent mode
+        - name: Retire the temporary v1 subagent override
           ansible.builtin.lineinfile:
             path: "{{ gateway_codex_config }}"
-            regexp: '^multi_agent_v2\s*='
-            insertafter: '^\[features\]$'
-            line: 'multi_agent_v2 = { enabled = false } # Temporary: Modal cannot consume encrypted v2 agent handoffs.'
+            regexp: '^multi_agent_v2\s*=\s*\{\s*enabled\s*=\s*false\s*\}\s*# Temporary: Modal cannot consume encrypted v2 agent handoffs\.$'
+            state: absent
           register: gateway_subagent_mode_change
 
         - name: Record whether Grace Codex configuration changed
