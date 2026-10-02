@@ -1,5 +1,8 @@
 # Codex Gateway
 
+> **Personal project:** This is my personal setup. I'm sharing the source in the
+> hope that it benefits others. I am not accepting outside pull requests at this time.
+
 Grace's local gateway for Codex subscription traffic and additional model providers. Native Responses requests are forwarded to Grace's existing ChatGPT subscription endpoint. The gateway keeps request bytes and streamed response bytes intact, forwards native WebSockets, and logs route, status, timing, and completed token counts without logging prompts or credentials. Unknown `/v1/*` routes are logged and forwarded to the matching subscription path. A model with an unregistered adapter namespace fails locally.
 
 The gateway listens on `127.0.0.1:48766`. It uses Grace's existing `~/.codex/auth.json`; it does not create another login. Near access-token expiry, it asks Codex's app server to refresh the managed ChatGPT login and rereads the credential file. The model catalog is fetched from the subscription endpoint, merged with compiled adapters, and written atomically. The last good catalog stays in place if refresh fails. Codex discovers the installed catalog through `/v1/models`; matching ETags on Models and Responses prompt running app servers to refresh after a catalog change. There are no ledger writes in v0.
